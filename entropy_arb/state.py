@@ -21,6 +21,14 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 log = logging.getLogger("state")
 
 
+def global_lock_dir() -> str:
+    """Fixed absolute directory for cross-config/cross-CWD account+market locks."""
+    override = os.getenv("ENTROPY_ARB_LOCK_DIR")
+    if override and override.strip():
+        return os.path.abspath(os.path.expanduser(override.strip()))
+    return os.path.join(os.path.expanduser("~"), ".entropy-arb", "locks")
+
+
 class StateStore:
     """Atomic JSON file store for engine risk & strategy state."""
 

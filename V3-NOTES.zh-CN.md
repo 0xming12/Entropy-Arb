@@ -27,10 +27,13 @@
 1. **Hyperliquid `HL_ACCOUNT_ADDRESS` 强制必填 + 启动期链上 Agent 授权校验（High）**：
    - `HLCreds.complete` 强制要求有效的 42 位 `0x` `HL_ACCOUNT_ADDRESS`，`HLAccount` 不再静默回退到 Agent 钱包地址。
    - 启动期 `HLVenue.verify_account()` 调用 Hyperliquid `userRole` 与 `extraAgents` 校验签名私钥确实是该 `HL_ACCOUNT_ADDRESS` 的未过期授权 Agent（或主钱包本人），否则拒绝启动，彻底杜绝查空 Agent 账户误平对冲腿的风险。
-2. **小额残余敞口全平放行（Medium）**：
-   - `_hedge_attempts()` 当 `reduce_only` 补单可一次性全平该交易所残余仓位时，豁免 `min_order_notional`/`min_quote`（Hyperliquid 与 Lighter 均对全平 `reduce_only` 碎单豁免 \$10 门槛），并且当仓位变化进入可平状态时立即解除 `_unhedgeable_until` 冷却。
-3. **按交易所账户+品种维度加独占锁（Medium）**：
-   - 实盘启动后对每个交易所的 `state_identity()`（如 `io:NVDA` + HL 主账户地址）额外加 `venue_<hash>.lock` 独占文件锁，阻止同品种同时跑 `--hedge lighter` 与 `--hedge lighter-rh` 互相把对方成交当仓位漂移而误对冲。
+2. **小额残余 / 亚步长敞口全覆盖平仓（Medium）**：
+   - 独立碎单全平：`_hedge_attempts()` 当单腿 `reduce_only` 补单可一次性全平该交易所残余仓位时，豁免 `min_order_notional`/`min_quote`。
+   - 叠加在匹配仓位上的小额 / 亚 `_step` 残余：新增 `_try_rebalance_submin_hedge()`，通过**双腿非对称 `reduce_only` 再平衡**（超额腿多减、对侧腿按最小合规额减仓，双腿均严格满足 `min_quote <= notional <= max_order_notional`，大残余自动分片）直接清零残余净敞口，不再长期锁死在 `REDUCE-ONLY`。
+3. **全局固定目录的账户+品种独占锁（Medium/Low）**：
+   - 实盘启动后对每个交易所的 `state_identity()`（如 `io:NVDA` + HL 主账户地址）在固定绝对路径 `~/.entropy-arb/locks`（可通过 `ENTROPY_ARB_LOCK_DIR` 覆盖）加 `venue_<hash>.lock` 独占文件锁，完全独立于各配置文件的 `state_dir` 与工作目录 `CWD`。
+4. **动态中枢下的库存成本基准闭环归因（Low）**：
+   - 新增 `_attribute_pair_pnl()` 并在 `state.json` 中持久化 `inv_basis`（开仓净量、加权平均现金价差与已入账基准）；平仓时严格按真实闭环现金盈亏 `avg_entry_cash + close_cash` 计算 `daily_realized_pnl_usd` 与 `max_consecutive_losses`，消除 `dynamic_midline` 漂移导致的假盈利/漏计连亏问题。
 4. **未决 `not-found` IOC 过期自愈 + 人工备份式恢复工具（Low）**：
    - 新增 `execution.pending_not_found_expire_sec`（默认 `120.0` 秒，`0` = 关闭）：对连续 3 次返回 `unknownOid`/`not-found` 且超过过期窗口的 `known_filled=0` 未决 IOC，在**双边链上持仓严格吻合零成交预期**的前提下安全按零成交结案；若链上仓位不符则继续保持暂停。
    - 升级 `tools/inspect_order_state.py`，新增 `--resolve-zero-fill`、`--set-position`、`--clear-reconcile`（必须带 `--confirm`，修改前自动生成 `.bak.<ts>` 备份并原子写入）。

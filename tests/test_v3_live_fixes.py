@@ -711,36 +711,194 @@ def test_review_high_hl_account_address_required_and_verified():
 
 
 def test_review_medium_shared_entropy_venue_lock_blocks_overlapping_hedges():
-    tmp_dir = tempfile.mkdtemp(prefix="entropy_v3_vlock_")
-    extra = f'persistence:\n  enabled: true\n  state_dir: "{tmp_dir}"\n  lock_enabled: true\n'
-    eng_lighter = make_engine(extra, hedge="lighter")
-    eng_rh = make_engine(extra, hedge="lighter-rh")
-
-    shared_entropy_id = "https://api.hyperliquid.xyz/0x" + "a" * 40 + "/io:NVDA"
-    eng_lighter.entropy.state_identity = lambda: shared_entropy_id
-    eng_lighter.hedge.state_identity = lambda: "https://mainnet.zklighter.elliot.ai/10/15"
-    eng_rh.entropy.state_identity = lambda: shared_entropy_id
-    eng_rh.hedge.state_identity = lambda: "https://api.rh.lighter.xyz/10/15"
-
-    eng_lighter._acquire_venue_locks()
+    lock_dir = tempfile.mkdtemp(prefix="entropy_v3_glock_")
+    state_dir_a = tempfile.mkdtemp(prefix="entropy_v3_state_a_")
+    state_dir_b = tempfile.mkdtemp(prefix="entropy_v3_state_b_")
+    orig_env = os.environ.get("ENTROPY_ARB_LOCK_DIR")
+    os.environ["ENTROPY_ARB_LOCK_DIR"] = lock_dir
     try:
-        try:
-            eng_rh._acquire_venue_locks()
-            raise AssertionError("expected shared Entropy coin lock contention")
-        except RuntimeError as e:
-            assert "already running" in str(e) and "io:NVDA" in str(e)
-        # Different symbol on same HL account MUST still be allowed
-        eng_other = make_engine(extra, hedge="lighter-rh")
-        eng_other.entropy.state_identity = lambda: "https://api.hyperliquid.xyz/0x" + "a" * 40 + "/io:SNDK"
-        eng_other.hedge.state_identity = lambda: "https://api.rh.lighter.xyz/10/99"
-        eng_other._acquire_venue_locks()
-        eng_other._release_venue_locks()
-    finally:
-        eng_lighter._release_venue_locks()
+        extra_a = f'persistence:\n  enabled: true\n  state_dir: "{state_dir_a}"\n  lock_enabled: true\n'
+        extra_b = f'persistence:\n  enabled: true\n  state_dir: "{state_dir_b}"\n  lock_enabled: true\n'
+        eng_lighter = make_engine(extra_a, hedge="lighter")
+        eng_rh = make_engine(extra_b, hedge="lighter-rh")
 
-    # Once released, the second instance acquires cleanly
-    eng_rh._acquire_venue_locks()
-    eng_rh._release_venue_locks()
+        shared_entropy_id = "https://api.hyperliquid.xyz/0x" + "a" * 40 + "/io:NVDA"
+        eng_lighter.entropy.state_identity = lambda: shared_entropy_id
+        eng_lighter.hedge.state_identity = lambda: "https://mainnet.zklighter.elliot.ai/10/15"
+        eng_rh.entropy.state_identity = lambda: shared_entropy_id
+        eng_rh.hedge.state_identity = lambda: "https://api.rh.lighter.xyz/10/15"
+
+        # Different state_dir AND different CWD MUST STILL conflict on the global lock!
+        orig_cwd = os.getcwd()
+        os.chdir(state_dir_a)
+        try:
+            eng_lighter._acquire_venue_locks()
+            os.chdir(state_dir_b)
+            try:
+                eng_rh._acquire_venue_locks()
+                raise AssertionError("expected shared Entropy coin lock contention across state_dirs")
+            except RuntimeError as e:
+                assert "already running" in str(e) and "io:NVDA" in str(e)
+            # Different symbol on same HL account MUST still be allowed
+            eng_other = make_engine(extra_b, hedge="lighter-rh")
+            eng_other.entropy.state_identity = lambda: "https://api.hyperliquid.xyz/0x" + "a" * 40 + "/io:SNDK"
+            eng_other.hedge.state_identity = lambda: "https://api.rh.lighter.xyz/10/99"
+            eng_other._acquire_venue_locks()
+            eng_other._release_venue_locks()
+        finally:
+            os.chdir(orig_cwd)
+            eng_lighter._release_venue_locks()
+
+        # Once released, the second instance acquires cleanly
+        eng_rh._acquire_venue_locks()
+        eng_rh._release_venue_locks()
+    finally:
+        if orig_env is None:
+            os.environ.pop("ENTROPY_ARB_LOCK_DIR", None)
+        else:
+            os.environ["ENTROPY_ARB_LOCK_DIR"] = orig_env
+
+
+def test_review2_medium_submin_and_substep_residuals_rebalance_on_matched_inventory():
+    # Case 1: $8 residual (0.056 NVDA @ $144) on top of matched inventory with max_order_notional=$15
+    # automatically slices into 2 asymmetric reduce_only pairs, each leg strictly in [$10, $15]!
+    eng = make_engine("""
+sizing:
+  max_order_notional_usd: 15
+  min_order_notional_usd: 10
+execution:
+  hedge_retry_delay_sec: 0.0
+  hedge_max_retries: 3
+""", hedge="lighter")
+    eng._step, eng._min_base = 0.001, 0.025
+    eng.entropy.size_decimals = eng.hedge.size_decimals = 3
+    eng.entropy.set_book(143.98, 144.00)
+    eng.hedge.set_book(144.25, 144.27)
+    eng.entropy.position = 0.556
+    eng.hedge.position = -0.500
+    asyncio.run(eng._maybe_hedge())
+    assert abs(eng._net_position()) <= eng.cfg.net_tolerance_base
+    assert len(eng.entropy.sent_orders) == 2 and len(eng.hedge.sent_orders) == 2
+    for o in eng.entropy.sent_orders + eng.hedge.sent_orders:
+        assert o["reduce_only"] is True
+        assert 10.0 - 1e-6 <= o["qty"] * o["limit_px"] <= 15.0 + 1e-6
+
+    # Case 2: sub-_step residual (0.0005 when entropy has 4 decimals, hedge has 3, _step=0.001)
+    eng2 = make_engine("""
+sizing:
+  max_order_notional_usd: 25
+  min_order_notional_usd: 10
+execution:
+  net_tolerance_base: 0.0001
+  hedge_retry_delay_sec: 0.0
+""", hedge="lighter")
+    eng2._step, eng2._min_base = 0.001, 0.001
+    eng2.entropy.size_decimals = 4
+    eng2.hedge.size_decimals = 3
+    eng2.entropy.set_book(143.98, 144.00)
+    eng2.hedge.set_book(144.25, 144.27)
+    eng2.entropy.position = 0.5005
+    eng2.hedge.position = -0.5000
+    asyncio.run(eng2._maybe_hedge())
+    approx(eng2._net_position(), 0.0, tol=1e-9)
+    assert eng2.halted is False
+
+
+def test_review2_low_dynamic_midline_round_trip_pnl_and_consecutive_losses():
+    # Exact scenario from code review:
+    # Sell Entropy at +5 bps (mid = 0), then dynamic_midline drifts to +12 bps,
+    # then buy Entropy back at +8 bps (a REAL -3 bps round-trip loss!).
+    # MUST record net -$0.03 realized PnL and increment consecutive_losses!
+    eng = make_engine(
+        midline=0.0, upper=2.0, lower=2.0, leg_slip=2.0,
+        extra_yaml="""
+dynamic_midline:
+  enabled: true
+  method: ewma
+  window_minutes: 60.0
+  min_samples: 1
+  sample_interval_sec: 0.0
+risk:
+  max_consecutive_losses: 2
+  breaker_action: reduce_only
+""",
+    )
+    t0 = time.time()
+    for i in range(2):
+        # Set dynamic midline to 0.0 bps at entry
+        eng.dynamic_midline._ewma = 0.0
+        eng.dynamic_midline._samples.clear()
+        eng.dynamic_midline.update(0.0, now=t0 + i * 20)
+        eng.entropy.set_book(100.05, 100.06)
+        eng.hedge.set_book(99.99, 100.00)
+        entry_plan = ArbPlan(
+            qty=1.0, buy_limit=100.00, sell_limit=100.05,
+            buy_notional=100.00, sell_notional=100.05,
+            q_max=10.0, q_max_notional=1000.0,
+            top_premium_bps=5.0, marginal_premium_bps=5.0,
+            buy_fee=0.0, sell_fee=0.0,
+        )
+        eng.entropy.send_responses = [
+            {"status": "filled", "outcome": "filled", "filled_base": 1.0, "avg_px": 100.05,
+             "err": None, "unresolved": False, "client_order_id": f"dm-e-{i}"}
+        ]
+        eng.hedge.send_responses = [
+            {"status": "filled", "outcome": "filled", "filled_base": 1.0, "avg_px": 100.00,
+             "err": None, "unresolved": False, "client_order_id": f"dm-h-{i}"}
+        ]
+        asyncio.run(eng._execute(eng.hedge, eng.entropy, entry_plan))
+
+        # Dynamic midline drifts to +12 bps before exit!
+        eng.dynamic_midline._ewma = 12.0
+        eng.entropy.set_book(100.07, 100.08)
+        eng.hedge.set_book(100.00, 100.01)
+        exit_plan = ArbPlan(
+            qty=1.0, buy_limit=100.08, sell_limit=100.00,
+            buy_notional=100.08, sell_notional=100.00,
+            q_max=10.0, q_max_notional=1000.0,
+            top_premium_bps=-8.0, marginal_premium_bps=-8.0,
+            buy_fee=0.0, sell_fee=0.0,
+        )
+        eng.entropy.send_responses = [
+            {"status": "filled", "outcome": "filled", "filled_base": 1.0, "avg_px": 100.08,
+             "err": None, "unresolved": False, "client_order_id": f"dm-ex-e-{i}"}
+        ]
+        eng.hedge.send_responses = [
+            {"status": "filled", "outcome": "filled", "filled_base": 1.0, "avg_px": 100.00,
+             "err": None, "unresolved": False, "client_order_id": f"dm-ex-h-{i}"}
+        ]
+        asyncio.run(eng._execute(eng.entropy, eng.hedge, exit_plan))
+        assert eng.circuit_breaker.consecutive_losses == i + 1
+
+    # Total realized PnL across both losing round trips == 2 * (-$0.03) = -$0.06 EXACT!
+    approx(eng.circuit_breaker.daily_realized_pnl_usd, -0.06, tol=1e-6)
+    assert eng.circuit_breaker.loss_tripped is True
+
+    # Winning round trip under drifted midline (+5 entry @ mid 0, +2 exit @ mid +12 -> +$0.03)
+    eng2 = make_engine(midline=0.0, upper=2.0, lower=2.0, leg_slip=2.0)
+    eng2.dynamic_midline.enabled = True
+    eng2.dynamic_midline._ewma = 0.0
+    eng2.dynamic_midline.min_samples = 1
+    eng2.dynamic_midline.update(0.0, now=t0)
+    eng2.entropy.set_book(100.05, 100.06)
+    eng2.hedge.set_book(99.99, 100.00)
+    p_in = ArbPlan(1.0, 100.00, 100.05, 100.00, 100.05, 10.0, 1000.0, 5.0, 5.0, 0.0, 0.0)
+    eng2.entropy.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 1.0,
+                                    "avg_px": 100.05, "err": None, "unresolved": False, "client_order_id": "w1"}]
+    eng2.hedge.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 1.0,
+                                  "avg_px": 100.00, "err": None, "unresolved": False, "client_order_id": "w2"}]
+    asyncio.run(eng2._execute(eng2.hedge, eng2.entropy, p_in))
+    eng2.dynamic_midline._ewma = 12.0
+    eng2.entropy.set_book(100.01, 100.02)
+    eng2.hedge.set_book(100.00, 100.01)
+    p_out = ArbPlan(1.0, 100.02, 100.00, 100.02, 100.00, 10.0, 1000.0, -2.0, -2.0, 0.0, 0.0)
+    eng2.entropy.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 1.0,
+                                    "avg_px": 100.02, "err": None, "unresolved": False, "client_order_id": "w3"}]
+    eng2.hedge.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 1.0,
+                                  "avg_px": 100.00, "err": None, "unresolved": False, "client_order_id": "w4"}]
+    asyncio.run(eng2._execute(eng2.entropy, eng2.hedge, p_out))
+    approx(eng2.circuit_breaker.daily_realized_pnl_usd, +0.03, tol=1e-6)
+    assert eng2.circuit_breaker.consecutive_losses == 0
 
 
 def test_review_low_not_found_expiry_requires_count_age_and_chain_match_plus_cli_tool():
