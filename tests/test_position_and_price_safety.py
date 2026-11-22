@@ -81,12 +81,28 @@ sizing:
   max_order_notional_usd: 15
 """, hedge="lighter")
     engine._step, engine._min_base = 0.001, 0.025
-    engine.entropy.position = 0.035  # about $5 at these NVDA prices
     _profitable_pair(engine)
+
+    # Case 1: partial residual below $10 min notional alongside a matched position
+    # cannot be partially hedged below $10 and MUST block new entries.
+    engine.entropy.position = 0.535
+    engine.hedge.position = -0.500
     asyncio.run(engine._maybe_hedge())
-    assert engine.is_reduce_only() and run_scan(engine) is None
+    assert engine.is_reduce_only()
     assert engine.entropy.sent_orders == engine.hedge.sent_orders == []
-    engine.entropy.position = 0.0
+    # Only the reducing direction (sell entropy / buy hedge) can run; opening is blocked.
+    best = run_scan(engine)
+    assert best is None or best[1] is engine.entropy
+
+    # Case 2: once only the $5 dust residual remains on Entropy (full-close),
+    # _maybe_hedge() closes it cleanly with reduce_only=True (HL & Lighter exempt full-close dust).
+    engine.entropy.position = 0.035  # about $5 at these NVDA prices
+    engine.hedge.position = 0.0
+    asyncio.run(engine._maybe_hedge())
+    assert len(engine.entropy.sent_orders) == 1
+    assert engine.entropy.sent_orders[0]["reduce_only"] is True
+    assert abs(engine.entropy.position) <= 1e-9
+    _profitable_pair(engine)  # fresh book update after hedge fill
     assert not engine.is_reduce_only() and run_scan(engine) is not None
 
 

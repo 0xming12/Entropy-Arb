@@ -71,8 +71,9 @@ class StateStore:
 class InstanceLock:
     """Non-blocking exclusive file lock (fcntl.flock) to prevent duplicate live bots."""
 
-    def __init__(self, lock_path: str) -> None:
+    def __init__(self, lock_path: str, *, label: str = "") -> None:
         self.lock_path = lock_path
+        self.label = label
         self._fh = None
 
     def acquire(self) -> None:
@@ -89,14 +90,16 @@ class InstanceLock:
                 fh.seek(0)
                 holder = fh.read().strip()
                 fh.close()
+                scope = f" ({self.label})" if self.label else ""
                 raise RuntimeError(
-                    f"another live instance is already running for this pair "
-                    f"(lock: {self.lock_path}, pid={holder or 'unknown'}) / "
-                    f"检测到同品种实盘实例已在运行，禁止重复启动"
+                    f"another live instance is already running for this market/account{scope} "
+                    f"(lock: {self.lock_path}, holder={holder or 'unknown'}) / "
+                    f"检测到同品种或同账户市场实盘实例已在运行，禁止重复启动"
                 ) from e
         fh.seek(0)
         fh.truncate()
-        fh.write(f"{os.getpid()}\n")
+        info = f"{os.getpid()} {self.label}".strip()
+        fh.write(f"{info}\n")
         fh.flush()
         self._fh = fh
 

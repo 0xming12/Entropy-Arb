@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import logging
 import math
 import os
@@ -106,6 +107,7 @@ class Engine:
 
         # P0-1: pending order tracking, deduplication, and mandatory reconcile gate
         self._pending_orders: Dict[str, Dict[str, Any]] = {}
+        self._pending_not_found_counts: Dict[str, int] = {}
         self._settled_order_order: deque = deque(maxlen=512)
         self._settled_order_ids: set = set()
         self._reconcile_required: bool = False
@@ -116,6 +118,7 @@ class Engine:
         self._hedge_attempt_count = 0
         self._hedge_running = False
         self._unhedgeable_until = 0.0
+        self._unhedgeable_snapshot: Optional[Tuple[float, ...]] = None
         self._restored_ledger = False
 
         # P1-3: per-venue observed live taker fees (bps)
@@ -180,8 +183,11 @@ class Engine:
             StateStore(state_path) if cfg.persistence.enabled else None
         )
         self.instance_lock: Optional[InstanceLock] = (
-            InstanceLock(lock_path) if (cfg.persistence.lock_enabled and not record_only) else None
+            InstanceLock(lock_path, label=safe_pair)
+            if (cfg.persistence.lock_enabled and not record_only)
+            else None
         )
+        self._venue_instance_locks: List[InstanceLock] = []
 
     @staticmethod
     def _fresh_daily_breakdown(day_key: Optional[str]) -> Dict[str, Any]:
@@ -478,6 +484,38 @@ class Engine:
 
     # ------------------------------------------------------------- lifecycle
 
+    def _acquire_venue_locks(self) -> None:
+        """Acquire exclusive file locks keyed on every venue's account+market identity.
+
+        Prevents two live bots (e.g. --hedge lighter and --hedge lighter-rh for the
+        same symbol) from concurrently trading the same shared Entropy io:<symbol>
+        account position.
+        """
+        if self.record_only:
+            return
+        identities = sorted({
+            v.state_identity() for v in self.venues.values()
+            if hasattr(v, "state_identity")
+        })
+        acquired: List[InstanceLock] = []
+        try:
+            for ident in identities:
+                digest = hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16]
+                path = os.path.join(self.cfg.persistence.state_dir, f"venue_{digest}.lock")
+                lk = InstanceLock(path, label=ident)
+                lk.acquire()
+                acquired.append(lk)
+        except BaseException:
+            for lk in reversed(acquired):
+                lk.release()
+            raise
+        self._venue_instance_locks.extend(acquired)
+
+    def _release_venue_locks(self) -> None:
+        for lk in reversed(self._venue_instance_locks):
+            lk.release()
+        self._venue_instance_locks.clear()
+
     async def run(self) -> None:
         if not self.record_only and self.cfg.replay_only:
             raise RuntimeError("cannot trade with a replay_only configuration")
@@ -485,7 +523,8 @@ class Engine:
             raise RuntimeError(
                 "aiohttp is required to run the engine — pip install -r requirements.txt")
         if not self.record_only and self.instance_lock is None:
-            self.instance_lock = InstanceLock(self._lock_path)
+            self.instance_lock = InstanceLock(
+                self._lock_path, label=f"{self.cfg.symbol}_{self.cfg.hedge_venue}")
         if self.instance_lock is not None:
             self.instance_lock.acquire()
         self._state_can_write = False
@@ -508,6 +547,7 @@ class Engine:
             await self.notifier.flush(timeout=5.0)
             self.notifier.attach_session(None)
             await self.session.close()
+            self._release_venue_locks()
             if self.instance_lock is not None:
                 self.instance_lock.release()
 
@@ -530,12 +570,19 @@ class Engine:
             self._prime_startup_risk()
             if not cfg.creds_complete:
                 raise RuntimeError(
-                    "live trading needs credentials for both venues in .env "
-                    "(see .env.example); use --record-only to run without "
-                    "them / 实盘需要在 .env 中配置两个交易所的密钥，仅采集数据"
-                    "请用 --record-only")
+                    "live trading needs credentials (including HL_ACCOUNT_ADDRESS) for both "
+                    "venues in .env (see .env.example); use --record-only to run without "
+                    "them / 实盘需要在 .env 中完整配置两个交易所密钥及 HL_ACCOUNT_ADDRESS，"
+                    "仅采集数据请用 --record-only")
             self.entropy.init_signer()
             self.hedge.init_signer()
+            verify_tasks = [
+                v.verify_account() for v in self.venues.values()
+                if hasattr(v, "verify_account")
+            ]
+            if verify_tasks:
+                await asyncio.gather(*verify_tasks)
+            self._acquire_venue_locks()
             if self.hedge.kind == "hl":
                 self.entropy.share_nonces_with(self.hedge)
             # Even configurations that predate state persistence need an order journal.
@@ -1047,7 +1094,7 @@ class Engine:
         net = self._net_position()
         if (abs(net) > cfg.net_tolerance_base
                 and not self._hedge_retry_exhausted
-                and time.monotonic() >= self._unhedgeable_until):
+                and not self._is_unhedgeable_cooldown()):
             await self._maybe_hedge()
             if self.halted or self.has_pending_reconcile():
                 self._reset_signal()
@@ -1541,6 +1588,18 @@ class Engine:
             return
         await self._hedge(net)
 
+    def _pos_snapshot(self) -> Tuple[float, ...]:
+        return tuple(round(float(v.position), 12) for v in self.venues.values())
+
+    def _is_unhedgeable_cooldown(self) -> bool:
+        if time.monotonic() >= self._unhedgeable_until:
+            return False
+        if self._unhedgeable_snapshot != self._pos_snapshot():
+            self._unhedgeable_until = 0.0
+            self._unhedgeable_snapshot = None
+            return False
+        return True
+
     async def _hedge(self, net: float) -> None:
         """P1-1: Reduce net imbalance with:
         - Immediate P0-1 escalation on unknown/timeout outcome (zero duplicate hedges)
@@ -1549,7 +1608,7 @@ class Engine:
         - Halt + alert only if remaining net > tolerance after retry budget exhausted
         """
         if (self.has_pending_reconcile() or self._hedge_running or self._hedge_retry_exhausted
-                or time.monotonic() < self._unhedgeable_until):
+                or self._is_unhedgeable_cooldown()):
             return
         self._hedge_running = True
         try:
@@ -1563,6 +1622,7 @@ class Engine:
             if self.state_store is not None and not self.save_state():
                 self._stop_on_state_error("could not checkpoint resolved hedge exposure")
         self._unhedgeable_until = 0.0
+        self._unhedgeable_snapshot = None
 
     async def _hedge_attempts(self) -> None:
         cfg = self.cfg
@@ -1603,8 +1663,11 @@ class Engine:
                 lk = self._vlock(v.key)
                 if lk.locked():
                     continue
-                qty = floor_step(min(abs(cur_net), abs(v.position)), self._step)
-                if qty < v.min_base:
+                venue_step = 10 ** -v.size_decimals
+                closing_all_on_venue = abs(cur_net) >= abs(v.position) - 1e-9
+                step = min(self._step, venue_step) if closing_all_on_venue else self._step
+                qty = floor_step(min(abs(cur_net), abs(v.position)), step)
+                if qty <= 0.0:
                     continue
                 ref = v.book.best_bid() if is_sell else v.book.best_ask()
                 if ref is None:
@@ -1616,9 +1679,21 @@ class Engine:
                     else v.px_round(ref * (1.0 + slip), round_up=False)
                 )
                 order_price = max(ref, limit)
-                qty = floor_step(min(qty, cfg.max_order_notional / order_price), self._step)
-                if (qty <= 0.0 or qty < v.min_base
-                        or qty * limit < max(cfg.min_order_notional, v.min_quote)):
+                qty = floor_step(min(qty, cfg.max_order_notional / order_price), step)
+                # Both Hyperliquid and Lighter exempt a full-close reduce-only order
+                # from the $10 minimum notional rule when flattening residual dust.
+                full_venue_qty = floor_step(abs(v.position), venue_step)
+                is_full_close = (
+                    closing_all_on_venue
+                    and full_venue_qty >= venue_step
+                    and math.isclose(qty, full_venue_qty, rel_tol=0.0, abs_tol=1e-9)
+                )
+                min_base_req = venue_step if is_full_close else v.min_base
+                min_notional_ok = (
+                    is_full_close
+                    or qty * limit >= max(cfg.min_order_notional, v.min_quote)
+                )
+                if qty <= 0.0 or qty < min_base_req or not min_notional_ok:
                     continue
                 tried_venue = True
                 await lk.acquire()
@@ -1717,6 +1792,7 @@ class Engine:
 
             if not tried_venue:
                 self._unhedgeable_until = time.monotonic() + max(cfg.hedge_retry_delay_sec, 2.0)
+                self._unhedgeable_snapshot = self._pos_snapshot()
                 self._skiplog("[HEDGE] net %+.6g; no venue can reduce it within freshness, "
                               "rate or order-size limits", cur_net)
                 self.notifier.notify(
@@ -1757,6 +1833,7 @@ class Engine:
         expected = {key: v.position for key, v in self.venues.items()}
         settlements = []
         unsent = []
+        expired_not_found = []
         for key, rec in self._pending_orders.items():
             venue = self.venues.get(rec["venue_key"])
             if venue is None:
@@ -1774,9 +1851,29 @@ class Engine:
             result = await venue.query_order(rec["client_order_id"])
             if not isinstance(result, dict) or result.get("unresolved") is not False:
                 status = result.get("status") if isinstance(result, dict) else "invalid-response"
+                age = max(0.0, time.time() - float(rec.get("created_ts") or time.time()))
+                known = float(rec.get("known_filled") or 0.0)
+                if status == "not-found":
+                    nf_count = self._pending_not_found_counts.get(key, 0) + 1
+                    self._pending_not_found_counts[key] = nf_count
+                    expire_sec = self.cfg.pending_not_found_expire_sec
+                    if (expire_sec > 0.0 and known == 0.0
+                            and age >= expire_sec and nf_count >= 3):
+                        # IOC order never appeared on exchange past expiry window;
+                        # tentatively treat as zero-fill ONLY if both on-chain
+                        # positions strictly agree below.
+                        expired_not_found.append(key)
+                        settlements.append((
+                            key, venue, rec,
+                            {"status": "expired-not-found", "outcome": "canceled",
+                             "filled_base": 0.0, "avg_px": None, "unresolved": False},
+                            0.0,
+                        ))
+                        continue
+                else:
+                    self._pending_not_found_counts.pop(key, None)
                 log.warning("[PENDING] %s unresolved (%s)", key, status)
                 cur_net = self._net_position()
-                age = max(0.0, time.time() - float(rec.get("created_ts") or time.time()))
                 if abs(cur_net) > self.cfg.net_tolerance_base and age >= 15.0:
                     self.notifier.notify(
                         f"pending_unhedged:{key}",
@@ -1785,6 +1882,7 @@ class Engine:
                         f"verify exchange fills & positions manually",
                     )
                 return False
+            self._pending_not_found_counts.pop(key, None)
             try:
                 total = float(result["filled_base"])
             except (KeyError, TypeError, ValueError):
@@ -1833,6 +1931,7 @@ class Engine:
                 venue.volume_usd += additional * px
             venue.position = expected[venue.key]
         self._pending_orders.clear()
+        self._pending_not_found_counts.clear()
         self._reconcile_required = False
         if self.state_store is not None and not self.save_state():
             self._stop_on_state_error("could not checkpoint reconciled orders")
@@ -1840,6 +1939,9 @@ class Engine:
         self._update_evt.set()
         if unsent:
             log.info("[PENDING] cleared locally prepared, never submitted orders: %s", ", ".join(unsent))
+        if expired_not_found:
+            log.warning("[PENDING] settled expired not-found IOC order(s) as zero-fill after "
+                        "confirming both on-chain positions: %s", ", ".join(expired_not_found))
         log.info("[PENDING] orders and both positions reconciled")
         self.notifier.notify(
             "pending_order:resolved", "Orders and both positions reconciled", force=True)

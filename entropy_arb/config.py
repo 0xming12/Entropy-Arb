@@ -53,6 +53,16 @@ class LighterCreds:
                 and bool(self.api_private_key))
 
 
+def _is_eth_address(addr: Optional[str]) -> bool:
+    if not addr or len(addr) != 42 or not addr.startswith(("0x", "0X")):
+        return False
+    try:
+        int(addr[2:], 16)
+        return True
+    except ValueError:
+        return False
+
+
 @dataclass
 class HLCreds:
     private_key: Optional[str]
@@ -60,7 +70,7 @@ class HLCreds:
 
     @property
     def complete(self) -> bool:
-        return bool(self.private_key)
+        return bool(self.private_key) and _is_eth_address(self.account_address)
 
 
 @dataclass
@@ -184,6 +194,7 @@ class Config:
     check_worst_case_spread: bool = True
     reduce_only_min_worst_bps: float = -50.0
     reduce_only_exit_threshold_bps: Optional[float] = None
+    pending_not_found_expire_sec: float = 120.0
     risk: RiskConf = field(default_factory=RiskConf)
     session_filter: SessionFilterConf = field(default_factory=SessionFilterConf)
     dynamic_midline: DynamicMidlineConf = field(default_factory=DynamicMidlineConf)
@@ -253,6 +264,7 @@ _SCHEMA: Dict[str, Any] = {
         "reconcile_sec": float,
         "venue_probe_sec": float,
         "http_keepalive_sec": float,
+        "pending_not_found_expire_sec": float,
     },
     "risk": {
         "max_daily_loss_usd": float,
@@ -641,6 +653,53 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         raise ConfigError("sizing notional must satisfy 0 <= min <= max, with max > 0")
     if entropy.cap_usd <= 0 or hedge.cap_usd <= 0:
         raise ConfigError("entropy and hedge position caps must both be > 0")
+    if entropy.fee_bps < 0 or hedge.fee_bps < 0:
+        raise ConfigError("entropy.taker_fee_bps and hedge.taker_fee_bps must be >= 0")
+    if entropy.orders_per_min < 1 or hedge.orders_per_min < 1:
+        raise ConfigError("entropy.max_orders_per_min and hedge.max_orders_per_min must be >= 1")
+
+    inventory_scale_bps = float(_get(raw, "inventory", "scale_bps", 10.0))
+    inventory_floor_frac = float(_get(raw, "inventory", "floor_frac", 0.5))
+    if inventory_scale_bps < 0:
+        raise ConfigError("inventory.scale_bps must be >= 0")
+    if not 0.0 <= inventory_floor_frac < 1.0:
+        raise ConfigError("inventory.floor_frac must be in [0, 1)")
+
+    premium_persist_sec = float(_get(raw, "execution", "premium_persist_sec", 0.3))
+    cooldown_sec = float(_get(raw, "execution", "cooldown_sec", 0.0))
+    net_tolerance_base = float(_get(raw, "execution", "net_tolerance_base", 0.001))
+    max_consecutive_errors = int(_get(raw, "execution", "max_consecutive_errors", 3))
+    rate_limit_pause_sec = float(_get(raw, "execution", "rate_limit_pause_sec", 10.0))
+    staleness_sec = float(_get(raw, "execution", "staleness_sec", 10.0))
+    reconcile_sec = float(_get(raw, "execution", "reconcile_sec", 15.0))
+    venue_probe_sec = float(_get(raw, "execution", "venue_probe_sec", 30.0))
+    http_keepalive_sec = float(_get(raw, "execution", "http_keepalive_sec", 10.0))
+    pending_not_found_expire_sec = float(
+        _get(raw, "execution", "pending_not_found_expire_sec", 120.0))
+    status_interval_sec = float(_get(raw, "logging", "status_interval_sec", 30.0))
+
+    if premium_persist_sec < 0:
+        raise ConfigError("execution.premium_persist_sec must be >= 0")
+    if cooldown_sec < 0:
+        raise ConfigError("execution.cooldown_sec must be >= 0")
+    if net_tolerance_base < 0:
+        raise ConfigError("execution.net_tolerance_base must be >= 0")
+    if max_consecutive_errors < 1:
+        raise ConfigError("execution.max_consecutive_errors must be >= 1")
+    if rate_limit_pause_sec < 0:
+        raise ConfigError("execution.rate_limit_pause_sec must be >= 0")
+    if staleness_sec <= 0:
+        raise ConfigError("execution.staleness_sec must be > 0")
+    if reconcile_sec <= 0:
+        raise ConfigError("execution.reconcile_sec must be > 0")
+    if venue_probe_sec <= 0:
+        raise ConfigError("execution.venue_probe_sec must be > 0")
+    if http_keepalive_sec < 0:
+        raise ConfigError("execution.http_keepalive_sec must be >= 0")
+    if pending_not_found_expire_sec < 0:
+        raise ConfigError("execution.pending_not_found_expire_sec must be >= 0")
+    if status_interval_sec <= 0:
+        raise ConfigError("logging.status_interval_sec must be > 0")
 
     return Config(
         symbol=symbol,
@@ -654,10 +713,10 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         take_fraction=take_fraction,
         max_order_notional=max_order_notional,
         min_order_notional=min_order_notional,
-        inventory_scale_bps=float(_get(raw, "inventory", "scale_bps", 10.0)),
-        inventory_floor_frac=float(_get(raw, "inventory", "floor_frac", 0.5)),
-        premium_persist_sec=float(_get(raw, "execution", "premium_persist_sec", 0.3)),
-        cooldown_sec=float(_get(raw, "execution", "cooldown_sec", 0.0)),
+        inventory_scale_bps=inventory_scale_bps,
+        inventory_floor_frac=inventory_floor_frac,
+        premium_persist_sec=premium_persist_sec,
+        cooldown_sec=cooldown_sec,
         settle_timeout_sec=settle_timeout_sec,
         leg_slippage_bps=leg_slippage_bps,
         hedge_slippage_bps=hedge_slippage_bps,
@@ -667,17 +726,18 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         check_worst_case_spread=check_worst_case_spread,
         reduce_only_min_worst_bps=reduce_only_min_worst_bps,
         reduce_only_exit_threshold_bps=reduce_only_exit_threshold_bps,
-        net_tolerance_base=float(_get(raw, "execution", "net_tolerance_base", 0.001)),
-        max_consecutive_errors=int(_get(raw, "execution", "max_consecutive_errors", 3)),
-        rate_limit_pause_sec=float(_get(raw, "execution", "rate_limit_pause_sec", 10.0)),
-        staleness_sec=float(_get(raw, "execution", "staleness_sec", 10.0)),
-        reconcile_sec=float(_get(raw, "execution", "reconcile_sec", 15.0)),
-        venue_probe_sec=float(_get(raw, "execution", "venue_probe_sec", 30.0)),
-        http_keepalive_sec=float(_get(raw, "execution", "http_keepalive_sec", 10.0)),
+        pending_not_found_expire_sec=pending_not_found_expire_sec,
+        net_tolerance_base=net_tolerance_base,
+        max_consecutive_errors=max_consecutive_errors,
+        rate_limit_pause_sec=rate_limit_pause_sec,
+        staleness_sec=staleness_sec,
+        reconcile_sec=reconcile_sec,
+        venue_probe_sec=venue_probe_sec,
+        http_keepalive_sec=http_keepalive_sec,
         recorder_enabled=bool(_get(raw, "recorder", "enabled", True)),
         recorder_csv=_get(raw, "recorder", "csv", "logs/minutes.csv"),
         log_level=str(_get(raw, "logging", "level", "INFO")).upper(),
-        status_interval_sec=float(_get(raw, "logging", "status_interval_sec", 30.0)),
+        status_interval_sec=status_interval_sec,
         trades_csv=_get(raw, "logging", "trades_csv", "logs/trades.csv"),
         dashboard=bool(_get(raw, "logging", "dashboard", True)),
         log_file=_get(raw, "logging", "file", "logs/engine.log"),

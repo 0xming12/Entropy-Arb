@@ -51,8 +51,12 @@ class HLAccount:
     def __init__(self, private_key: str, account_address: Optional[str],
                  api_url: str) -> None:
         from eth_account import Account
+        if not account_address:
+            raise RuntimeError(
+                "HL_ACCOUNT_ADDRESS is required for live trading — never fall back to "
+                "the agent wallet address (positions/margins live on the main account)")
         self.wallet = Account.from_key(private_key)
-        self.query_address = (account_address or self.wallet.address).lower()
+        self.query_address = account_address.strip().lower()
         self.is_mainnet = api_url == "https://api.hyperliquid.xyz"
         self.nonces = NonceAllocator()
 
@@ -171,6 +175,70 @@ class HLVenue:
         self._signing = hl_signing
         self.account = HLAccount(c.private_key, c.account_address, self.api_url)
         log.info("[%s] %s", self.name, self.account.describe())
+
+    async def verify_account(self) -> None:
+        """Verify HL signer <-> HL_ACCOUNT_ADDRESS binding via userRole & extraAgents.
+
+        Blocks startup if an agent wallet key is paired with a missing, wrong, or
+        self-referential HL_ACCOUNT_ADDRESS, or if the agent authorization has expired.
+        """
+        assert self.account is not None
+        signer_addr = self.account.wallet.address.lower()
+        query_addr = self.account.query_address
+        try:
+            role_resp = await self._info({"type": "userRole", "user": signer_addr})
+        except Exception as e:
+            raise RuntimeError(
+                f"[{self.name}] failed to verify Hyperliquid signer role ({signer_addr}): {e!r}"
+            ) from e
+        if not isinstance(role_resp, dict) or not isinstance(role_resp.get("role"), str):
+            raise RuntimeError(
+                f"[{self.name}] unexpected Hyperliquid userRole response: {role_resp!r}"
+            )
+        role = role_resp["role"]
+        if role == "agent":
+            owner = str((role_resp.get("data") or {}).get("user") or "").lower()
+            if not owner:
+                raise RuntimeError(
+                    f"[{self.name}] signer {signer_addr} is an agent wallet with unknown owner"
+                )
+            if owner != query_addr:
+                raise RuntimeError(
+                    f"[{self.name}] HL_ACCOUNT_ADDRESS mismatch: signer {signer_addr} is an "
+                    f"approved agent for {owner}, NOT {query_addr}. Fix HL_ACCOUNT_ADDRESS in .env"
+                )
+            try:
+                agents = await self._info({"type": "extraAgents", "user": query_addr})
+            except Exception as e:
+                raise RuntimeError(
+                    f"[{self.name}] failed to verify extraAgents for {query_addr}: {e!r}"
+                ) from e
+            if isinstance(agents, list):
+                now_ms = int(time.time() * 1000)
+                for ag in agents:
+                    if str((ag or {}).get("address", "")).lower() == signer_addr:
+                        valid_until = ag.get("validUntil")
+                        if valid_until is not None and int(valid_until) <= now_ms:
+                            raise RuntimeError(
+                                f"[{self.name}] agent wallet {signer_addr} authorization expired "
+                                f"(validUntil={valid_until})"
+                            )
+                        break
+            log.info("[%s] verified agent %s -> main account %s",
+                     self.name, signer_addr, query_addr)
+            return
+        if role == "user":
+            if signer_addr != query_addr:
+                raise RuntimeError(
+                    f"[{self.name}] signer {signer_addr} is a main user wallet, not an approved "
+                    f"agent of HL_ACCOUNT_ADDRESS={query_addr}"
+                )
+            log.info("[%s] verified main wallet %s", self.name, query_addr)
+            return
+        raise RuntimeError(
+            f"[{self.name}] Hyperliquid signer {signer_addr} has unsupported/unapproved role "
+            f"{role!r} for HL_ACCOUNT_ADDRESS={query_addr}"
+        )
 
     def share_nonces_with(self, other: "HLVenue") -> None:
         if (self.account and other.account and
