@@ -1,0 +1,132 @@
+# entropy-arb strategy configuration / 策略配置
+#
+#   cp config.example.yaml config.yaml     then edit / 复制后修改
+#
+# This file IS the strategy. Credentials never live here — they go in .env
+# (see .env.example). Every key is validated: a typo is a startup error, not
+# a setting that silently does nothing.
+
+# ============================ THE SIGNAL / 信号 ============================
+thresholds:
+  midline_bps: 0.0         # persistent premium center / 溢价长期中枢
+  upper_bps: 4.0           # entry above midline: sell entropy / 中枢上方入场带宽
+  lower_bps: 4.0           # entry below midline: buy entropy / 中枢下方入场带宽
+  latency_buffer_bps: 3.0  # Lighter 300ms 延迟滑点缓冲（自动叠加到上下轨，0 = 关闭）
+
+# ======================== VENUES / 交易所参数 ==============================
+entropy:
+  dex: io                    # Entropy's dex name on Hyperliquid / Entropy 的 dex 名
+  taker_fee_bps: 1.0         # conservative taker fee baseline (HIP-3 Growth Mode ~0.9bps) / 吃单手续费保守基线
+  max_position_usd: 1000     # position cap / 持仓上限（美元）
+  max_orders_per_min: 120    # order-send budget, sliding 60s / 每分钟下单预算
+
+hedge:
+  taker_fee_bps: 0.0         # Lighter venues: 0; tradexyz: ~1.0
+  max_position_usd: 1000
+  max_orders_per_min: 30     # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
+
+# ========================= SIZING / 下单规模 ===============================
+sizing:
+  take_fraction: 0.5           # fraction of crossable depth to take / 吃掉可套利深度的比例
+  max_order_notional_usd: 500  # per-slice cap / 单笔名义上限
+  min_order_notional_usd: 10   # skip dust / 低于此名义不下单
+
+# ==================== INVENTORY LADDER / 库存阶梯 ==========================
+inventory:
+  scale_bps: 10.0
+  floor_frac: 0
+
+# ======================= EXECUTION / 执行参数 ==============================
+execution:
+  premium_persist_sec: 0.5     # edge must persist this long before firing / 信号需持续时间（过滤单 tick 闪烁）
+  cooldown_sec: 0.0            # min gap between executions / 两次执行的最小间隔
+  settle_timeout_sec: 10.0     # wait for fill confirmation / 等待成交确认
+  leg_slippage_bps: 15.0       # 每腿可放宽的上限。开启最差价差检查时，只使用仍能满足最差底线的部分（latency_buffer_bps 可作为滑点空间）
+  check_worst_case_spread: true   # 限价按两边费用、可用价差和价格精度收紧，并复核最差成交条件
+  reduce_only_min_worst_bps: -25.0 # 主动减仓允许的最差成交滑点下限（bps），避免平仓被限价复核卡死
+  reduce_only_exit_threshold_bps: null # 仅平仓模式触发阈值；null 表示沿用正常回归门槛（绝不亏本强平），填如 -5.0 表示允许小亏主动平仓
+  hedge_slippage_bps: 20.0     # price protection on delta hedges / 对冲滑点保护
+  hedge_max_retries: 3         # 单腿补单最大重试次数，连续失败达到上限将升级停机（halt）
+  hedge_retry_delay_sec: 1.0   # 单腿补单重试间隔（秒）
+  hedge_max_slippage_bps: 50.0 # 单腿补单价格保护硬上限（bps），舍入后亦严格不超过此上限
+  net_tolerance_base: 0.001    # max tolerated net delta (base units) / 允许的净敞口
+  max_consecutive_errors: 3    # halt after N straight failures / 连续失败 N 次后停机
+  rate_limit_pause_sec: 10.0   # pause a 429'd venue this long / 被限频后的暂停时长
+  staleness_sec: 10.0          # a feed older than this is stale / 行情连接超时判定
+  reconcile_sec: 15.0          # on-chain position sync cadence / 常规链上持仓核对周期（恢复上游默认 15s；未决单走独立对账）
+  venue_probe_sec: 30.0        # probe cadence for a down venue / 故障交易所探测周期
+  http_keepalive_sec: 10.0     # keep order-path TLS warm; 0 = off / 订单链路保活
+
+# ===================== RISK & CIRCUIT BREAKER / 实盘风控与熔断 ==============
+risk:
+  max_daily_loss_usd: 100.0            # 单日最大亏损上限（美元，按配置时区交易日重置）；0 = 关闭
+  max_consecutive_losses: 5            # 最大连续亏损笔数；0 = 关闭
+  breaker_action: reduce_only          # 触发亏损熔断后的行为：reduce_only（只平不开）或 halt（停机）
+  max_taker_fee_bps: 2.0               # Entropy 实时 Taker 费率上限（bps，查询失败时亦暂停新增风险）；0 = 关闭
+  fee_check_interval_sec: 60.0         # 费率轮询间隔（秒，默认 60 秒；成交回执/userFills 亦会即时校验）
+  reduce_only_ignore_session_buffer: true  # reduce_only 模式下减仓方向豁免休市缓冲，防止卡死平仓
+  max_book_age_sec: 30.0               # 盘口有效更新超时上限（秒，仅拦截开新仓并触发重连，不拦截减仓与补单；清淡标的建议 30~60s）；0 = 关闭
+  max_spread_bps: 150.0                # 极端价差绝对值上限（bps），防范单所插针或预言机脱锚；0 = 关闭
+  min_available_margin_usd: 100.0      # 单所可用保证金下限（美元，查询失败时亦暂停新增风险）；0 = 关闭
+  reconcile_drift_reduce_only: true    # 定时对账发现本地与链上仓位偏差超过容差时自动切 reduce_only 并告警
+
+# ================== US MARKET SESSION FILTER / 美股休市时段过滤 =============
+session_filter:
+  enabled: false                    # 是否启用美股时段过滤器（默认关闭以保持固定策略基线）
+  timezone: America/New_York        # 美东时区（自动处理 EDT/EST 夏冬令时）
+  regular_start: "09:30"            # 美股常规开盘时间（美东）
+  regular_end: "16:00"              # 美股常规收盘时间（美东）
+  early_close_end: "13:00"          # 提前收盘日收盘时间（美东）
+  off_hours_mode: reduce_only       # 休市策略：reduce_only（只允许平仓）或 throttle（缩仓+拉宽阈值）
+  off_hours_cap_multiplier: 0.3     # throttle 模式下最大持仓上限缩减比例 (0, 1]
+  off_hours_spread_buffer_bps: 5.0  # throttle 模式下额外拉宽的开仓阈值（bps）
+  weekend_reduce_only: true         # 周末与节假日是否强制进入 reduce_only 模式
+  holidays:
+    - "2026-11-26"                  # 感恩节 Thanksgiving
+    - "2026-12-25"                  # 圣诞节 Christmas
+    - "2027-01-01"                  # 元旦 New Year's Day
+    - "2027-01-18"                  # 马丁·路德·金纪念日 MLK Day
+    - "2027-02-15"                  # 总统日 Presidents' Day
+  early_close_dates:
+    - "2026-11-27"                  # 感恩节次日 Black Friday
+    - "2026-12-24"                  # 平安夜 Christmas Eve
+
+# ==================== DYNAMIC MIDLINE / 动态滚动中轴 =======================
+dynamic_midline:
+  enabled: false              # 是否启用动态滚动中轴（默认关闭）
+  method: ewma                # 计算方法：ewma（指数加权移动平均）或 rolling_median（滚动中位数）
+  window_minutes: 180.0       # 滚动窗口时长（分钟，默认 180 分钟）
+  min_samples: 60             # 预热最小样本数，不足时回退到静态 midline_bps
+  sample_interval_sec: 5.0    # 最小采样间隔（秒）
+  std_band_multiplier: 0.0    # 可选：按滚动标准差自动微调上下轨宽度系数（0 = 关闭）
+
+# ==================== FUNDING CARRY SKEW / 资金费率差偏移 ==================
+funding_skew:
+  enabled: false              # 是否启用资金费率差偏移（默认关闭）
+  expected_hold_hours: 4.0    # 预期持仓小时数（用于折算资金费率收益/成本）
+  poll_interval_sec: 300.0    # 资金费率拉取周期（秒，默认 300 秒）
+  max_skew_bps: 10.0          # 单方向最大偏移上限（bps，0 = 不限制）
+  min_net_edge_bps: 1.0       # 扣除资金费率偏移后的净入场边际下限（bps），防止负边际倒贴点差开仓
+
+# ==================== PERSISTENCE & LOCK / 状态持久化与防双开 ===============
+persistence:
+  enabled: true               # 兼容旧配置。实盘始终持久化订单、账本和风险状态
+  state_dir: data             # 状态文件与进程锁存放目录
+  lock_enabled: true          # 兼容旧配置。实盘始终启用同品种+对冲腿文件锁
+
+# ==================== NOTIFICATIONS / Telegram 告警配置 ====================
+notifications:
+  throttle_sec: 60.0          # 同类告警节流防刷屏间隔（秒）
+
+# ================== DATA RECORDER / 数据采集 ===============================
+recorder:
+  enabled: true
+  csv: logs/minutes.csv
+
+# ==================== LOGGING & DASHBOARD / 日志与仪表盘 ====================
+logging:
+  level: INFO
+  status_interval_sec: 30.0
+  trades_csv: logs/trades.csv
+  dashboard: true
+  file: logs/engine.log

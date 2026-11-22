@@ -1,0 +1,24 @@
+# Historical comparison only. The replay derives the midline from earlier data
+# and takes explicit fee, slippage and funding assumptions from its CLI.
+replay_only: true
+thresholds:
+  midline_bps: 0.0
+  upper_bps: 7.5
+  lower_bps: 7.5
+entropy:
+  dex: io
+  max_position_usd: 20
+hedge:
+  max_position_usd: 20
+sizing:
+  take_fraction: 0.5
+  max_order_notional_usd: 15
+  min_order_notional_usd: 10
+execution:
+  premium_persist_sec: 2.0
+  cooldown_sec: 15.0
+  leg_slippage_bps: 50.0
+  check_worst_case_spread: true
+  staleness_sec: 10.0
+risk:
+  max_book_age_sec: 5.0

@@ -1,0 +1,116 @@
+# Small-capital live test template / 小资金实盘联调配置模板
+# Copy to config.live.yaml, calibrate thresholds from recorded data, and verify
+# exchange balances/leverage before starting with `--live`.
+# 复制为 config.live.yaml，先根据采集数据校准 thresholds，确认杠杆与余额后再用 --live 启动。
+
+thresholds:
+  midline_bps: 0.0          # MUST calibrate from tools/analyze.py / 务必用 analyze.py 校准
+  upper_bps: 6.0            # entry band above midline / 中枢上方带宽
+  lower_bps: 6.0            # entry band below midline / 中枢下方带宽
+  latency_buffer_bps: 3.0   # Lighter 延迟滑点缓冲（同时提供边界吃单滑点空间）
+
+entropy:
+  dex: io
+  taker_fee_bps: 1.0        # HIP-3 Growth Mode 保守基线（~0.9 bps）
+  max_position_usd: 30.0    # 小资金测试仓位上限
+  max_orders_per_min: 60
+
+hedge:
+  taker_fee_bps: 0.0        # Lighter=0；若用 --hedge tradexyz 请改为 1.0
+  max_position_usd: 30.0
+  max_orders_per_min: 30
+
+sizing:
+  take_fraction: 0.5
+  max_order_notional_usd: 15.0
+  min_order_notional_usd: 10.0
+
+inventory:
+  scale_bps: 8.0
+  floor_frac: 0.0
+
+execution:
+  premium_persist_sec: 0.5
+  cooldown_sec: 5.0
+  settle_timeout_sec: 10.0
+  leg_slippage_bps: 15.0
+  check_worst_case_spread: true
+  reduce_only_min_worst_bps: -25.0
+  reduce_only_exit_threshold_bps: null   # 默认仅在回归正常门槛时平仓，绝不因休市/接口超时亏本强平
+  hedge_slippage_bps: 20.0
+  hedge_max_retries: 3
+  hedge_retry_delay_sec: 1.0
+  hedge_max_slippage_bps: 40.0
+  net_tolerance_base: 0.001
+  max_consecutive_errors: 3
+  rate_limit_pause_sec: 10.0
+  staleness_sec: 10.0
+  reconcile_sec: 15.0
+  venue_probe_sec: 30.0
+  http_keepalive_sec: 10.0
+
+risk:
+  max_daily_loss_usd: 15.0
+  max_consecutive_losses: 5
+  breaker_action: reduce_only
+  max_taker_fee_bps: 2.0
+  fee_check_interval_sec: 60.0
+  reduce_only_ignore_session_buffer: true
+  max_book_age_sec: 30.0
+  max_spread_bps: 150.0
+  min_available_margin_usd: 20.0         # 按你的小资金测试保证金下调，避免开机被锁死
+  reconcile_drift_reduce_only: true
+
+session_filter:
+  enabled: true
+  timezone: America/New_York
+  regular_start: "09:30"
+  regular_end: "16:00"
+  early_close_end: "13:00"
+  off_hours_mode: reduce_only
+  off_hours_cap_multiplier: 0.3
+  off_hours_spread_buffer_bps: 5.0
+  weekend_reduce_only: true
+  holidays:
+    - "2026-11-26"
+    - "2026-12-25"
+    - "2027-01-01"
+    - "2027-01-18"
+    - "2027-02-15"
+  early_close_dates:
+    - "2026-11-27"
+    - "2026-12-24"
+
+dynamic_midline:
+  enabled: false
+  method: ewma
+  window_minutes: 180.0
+  min_samples: 60
+  sample_interval_sec: 5.0
+  std_band_multiplier: 0.0
+
+funding_skew:
+  enabled: false
+  expected_hold_hours: 4.0
+  poll_interval_sec: 300.0
+  max_skew_bps: 10.0
+  min_net_edge_bps: 1.0
+
+persistence:
+  enabled: true
+  state_dir: data/live-test
+  lock_enabled: true
+
+notifications:
+  throttle_sec: 60.0
+
+recorder:
+  enabled: true
+  csv: logs/live-test-minutes.csv
+
+logging:
+  level: INFO
+  status_interval_sec: 30.0
+  trades_csv: logs/live-test-trades.csv
+  dashboard: true
+  file: logs/live-test-engine.log
