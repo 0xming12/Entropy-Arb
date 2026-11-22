@@ -987,6 +987,237 @@ def test_review_low_config_numeric_range_validations():
             assert needle in str(e), f"{needle!r} not in {e}"
 
 
+def test_review3_medium_coarser_over_venue_rebalances_finer_residual():
+    # Exact reviewer scenario: entropy (szDecimals=2, step=0.01) at +0.50 vs
+    # hedge (szDecimals=3, step=0.001) at -0.495 -> net +0.005 finer than over_step!
+    eng = make_engine("""
+sizing:
+  max_order_notional_usd: 15
+  min_order_notional_usd: 10
+execution:
+  net_tolerance_base: 0.0005
+  hedge_retry_delay_sec: 0.0
+  hedge_max_retries: 3
+""", hedge="lighter")
+    eng._step, eng._min_base = 0.01, 0.01
+    eng.entropy.size_decimals = 2
+    eng.hedge.size_decimals = 3
+    eng.entropy.set_book(143.98, 144.00)
+    eng.hedge.set_book(144.25, 144.27)
+    eng.entropy.position = 0.50
+    eng.hedge.position = -0.495
+    asyncio.run(eng._maybe_hedge())
+    approx(eng._net_position(), 0.0, tol=1e-9)
+    assert eng.halted is False
+    assert eng._unhedgeable_until == 0.0
+    assert len(eng.entropy.sent_orders) == 1 and len(eng.hedge.sent_orders) == 1
+    assert eng.entropy.sent_orders[0]["reduce_only"] is True
+    assert eng.hedge.sent_orders[0]["reduce_only"] is True
+    approx(eng.entropy.sent_orders[0]["qty"], 0.08, tol=1e-9)
+    approx(eng.hedge.sent_orders[0]["qty"], 0.075, tol=1e-9)
+
+    # Multi-slice coarser-over scenario: +0.50 vs -0.445 (net +0.055) with $15 cap
+    eng2 = make_engine("""
+sizing:
+  max_order_notional_usd: 15
+  min_order_notional_usd: 10
+execution:
+  net_tolerance_base: 0.0005
+  hedge_retry_delay_sec: 0.0
+  hedge_max_retries: 3
+""", hedge="lighter")
+    eng2._step, eng2._min_base = 0.01, 0.01
+    eng2.entropy.size_decimals = 2
+    eng2.hedge.size_decimals = 3
+    eng2.entropy.set_book(143.98, 144.00)
+    eng2.hedge.set_book(144.25, 144.27)
+    eng2.entropy.position = 0.50
+    eng2.hedge.position = -0.445
+    asyncio.run(eng2._maybe_hedge())
+    approx(eng2._net_position(), 0.0, tol=1e-9)
+    assert eng2.halted is False
+    assert len(eng2.entropy.sent_orders) == 2 and len(eng2.hedge.sent_orders) == 2
+    for o in eng2.entropy.sent_orders + eng2.hedge.sent_orders:
+        assert o["reduce_only"] is True
+        assert 10.0 - 1e-6 <= o["qty"] * o["limit_px"] <= 15.0 + 1e-6
+
+    # Negative-net coarser-over scenario: -0.50 vs +0.495 (net -0.005)
+    eng3 = make_engine("""
+sizing:
+  max_order_notional_usd: 15
+  min_order_notional_usd: 10
+execution:
+  net_tolerance_base: 0.0005
+  hedge_retry_delay_sec: 0.0
+""", hedge="lighter")
+    eng3._step, eng3._min_base = 0.01, 0.01
+    eng3.entropy.size_decimals = 2
+    eng3.hedge.size_decimals = 3
+    eng3.entropy.set_book(143.98, 144.00)
+    eng3.hedge.set_book(144.25, 144.27)
+    eng3.entropy.position = -0.50
+    eng3.hedge.position = 0.495
+    asyncio.run(eng3._maybe_hedge())
+    approx(eng3._net_position(), 0.0, tol=1e-9)
+    assert eng3.halted is False
+
+
+def test_review3_low_inv_basis_clamps_on_rebalance_drift_and_late_timeout_settlement():
+    # Sub-case A: Rebalance flattens -0.07 inventory -> basis MUST reset to 0 so
+    # the next normal entry is booked as an opening fill and NEVER resets consecutive_losses!
+    eng = make_engine("""
+sizing:
+  max_order_notional_usd: 20
+  min_order_notional_usd: 10
+execution:
+  hedge_retry_delay_sec: 0.0
+risk:
+  max_consecutive_losses: 3
+""", hedge="lighter", midline=0.0, upper=2.0, lower=2.0, leg_slip=2.0)
+    eng._step, eng._min_base = 0.001, 0.001
+    eng.entropy.size_decimals = eng.hedge.size_decimals = 3
+    eng.entropy.set_book(144.06, 144.08)
+    eng.hedge.set_book(143.99, 144.00)
+    p_open = ArbPlan(0.07, 144.00, 144.06, 10.08, 10.0842, 1.0, 144.0, 4.0, 4.0, 0.0, 0.0)
+    eng.entropy.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 0.07,
+                                   "avg_px": 144.06, "err": None, "unresolved": False, "client_order_id": "ra-e1"}]
+    eng.hedge.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 0.07,
+                                 "avg_px": 144.00, "err": None, "unresolved": False, "client_order_id": "ra-h1"}]
+    asyncio.run(eng._execute(eng.hedge, eng.entropy, p_open))
+    approx(eng._inv_signed_qty, -0.07, tol=1e-9)
+
+    # Simulate an extra -0.005 residual on Entropy; at $140, 0.070 * $140 < $10 (dust full-close)
+    # so rebalance closes the entire -0.075 / +0.070 position down to flat (0/0)!
+    eng.entropy.set_book(140.00, 140.02)
+    eng.hedge.set_book(139.98, 140.00)
+    eng.entropy.position = -0.075
+    eng.hedge.position = 0.070
+    asyncio.run(eng._maybe_hedge())
+    approx(eng.entropy.position, 0.0, tol=1e-9)
+    approx(eng.hedge.position, 0.0, tol=1e-9)
+    approx(eng._inv_signed_qty, 0.0, tol=1e-9)
+
+    # Set consecutive_losses=2, then take a normal opening entry (+0.07 long Entropy) ->
+    # MUST NOT treat it as closing a stale -0.07 basis or reset consecutive_losses to 0!
+    eng.circuit_breaker.consecutive_losses = 2
+    eng.entropy.set_book(149.99, 150.00)
+    eng.hedge.set_book(150.06, 150.08)
+    p_open2 = ArbPlan(0.07, 150.00, 150.06, 10.50, 10.5042, 1.0, 150.0, -4.0, -4.0, 0.0, 0.0)
+    eng.entropy.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 0.07,
+                                   "avg_px": 150.00, "err": None, "unresolved": False, "client_order_id": "ra-e2"}]
+    eng.hedge.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 0.07,
+                                 "avg_px": 150.06, "err": None, "unresolved": False, "client_order_id": "ra-h2"}]
+    asyncio.run(eng._execute(eng.entropy, eng.hedge, p_open2))
+    assert eng.circuit_breaker.consecutive_losses == 2
+    approx(eng._inv_signed_qty, 0.07, tol=1e-9)
+
+    # Partial rebalance reduction also clamps basis to remaining matched qty
+    eng.entropy.position = 0.075
+    eng.hedge.position = -0.070
+    asyncio.run(eng._maybe_hedge())
+    approx(eng._net_position(), 0.0, tol=1e-9)
+    approx(eng._inv_signed_qty, eng.entropy.position, tol=1e-9)
+
+    # Sub-case B: Late timed-out ENTRY leg settled via _reconcile_pending_orders ->
+    # basis is tracked so the subsequent losing round trip counts ONCE (not twice).
+    eng_b = make_engine(
+        midline=0.0, upper=2.0, lower=2.0, leg_slip=2.0,
+        extra_yaml="risk:\n  max_consecutive_losses: 3\n",
+    )
+    eng_b.entropy.set_book(100.05, 100.06)
+    eng_b.hedge.set_book(99.99, 100.00)
+    p_in = ArbPlan(1.0, 100.00, 100.05, 100.00, 100.05, 10.0, 1000.0, 5.0, 5.0, 0.0, 0.0)
+    eng_b.entropy.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 1.0,
+                                     "avg_px": 100.05, "err": None, "unresolved": False, "client_order_id": "rb-e1"}]
+    eng_b.hedge.send_responses = [{"status": "timeout", "outcome": "unknown", "filled_base": 0.0,
+                                   "avg_px": None, "err": "timeout", "unresolved": True, "client_order_id": "rb-h1"}]
+    asyncio.run(eng_b._execute(eng_b.hedge, eng_b.entropy, p_in))
+    assert eng_b.has_pending_reconcile() is True
+    # Late reconcile confirms Hedge filled 1.0 @ 100.00
+    eng_b.hedge.order_queries["rb-h1"] = {
+        "status": "filled", "outcome": "filled", "filled_base": 1.0,
+        "avg_px": 100.00, "err": None, "unresolved": False, "client_order_id": "rb-h1",
+    }
+    eng_b.entropy.chain_position = -1.0
+    eng_b.hedge.chain_position = 1.0
+    assert asyncio.run(eng_b._reconcile_pending_orders()) is True
+    approx(eng_b._inv_signed_qty, -1.0, tol=1e-9)
+    approx(eng_b.circuit_breaker.daily_realized_pnl_usd, 0.05, tol=1e-6)
+    assert eng_b.circuit_breaker.consecutive_losses == 0
+
+    # Now exit at a real -$0.03 round-trip loss (buy Entropy 100.08, sell Hedge 100.00)
+    eng_b.entropy.set_book(100.07, 100.08)
+    eng_b.hedge.set_book(100.00, 100.01)
+    p_out = ArbPlan(1.0, 100.08, 100.00, 100.08, 100.00, 10.0, 1000.0, -8.0, -8.0, 0.0, 0.0)
+    eng_b.entropy.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 1.0,
+                                     "avg_px": 100.08, "err": None, "unresolved": False, "client_order_id": "rb-e2"}]
+    eng_b.hedge.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 1.0,
+                                   "avg_px": 100.00, "err": None, "unresolved": False, "client_order_id": "rb-h2"}]
+    asyncio.run(eng_b._execute(eng_b.entropy, eng_b.hedge, p_out, reduce_only=True))
+    approx(eng_b.circuit_breaker.daily_realized_pnl_usd, -0.03, tol=1e-6)
+    assert eng_b.circuit_breaker.consecutive_losses == 1
+    approx(eng_b._inv_signed_qty, 0.0, tol=1e-9)
+
+    # Sub-case C: Late timed-out CLOSING leg preserves entry basis across timeout & restart!
+    tmp_dir = tempfile.mkdtemp(prefix="entropy_v3_r3_c_")
+    extra_c = f"""
+risk:
+  max_consecutive_losses: 3
+persistence:
+  enabled: true
+  state_dir: "{tmp_dir}"
+"""
+    eng_c = make_engine(extra_c, midline=0.0, upper=2.0, lower=2.0, leg_slip=2.0)
+    eng_c.entropy.set_book(100.05, 100.06)
+    eng_c.hedge.set_book(99.99, 100.00)
+    eng_c.entropy.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 1.0,
+                                     "avg_px": 100.05, "err": None, "unresolved": False, "client_order_id": "rc-e1"}]
+    eng_c.hedge.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 1.0,
+                                   "avg_px": 100.00, "err": None, "unresolved": False, "client_order_id": "rc-h1"}]
+    asyncio.run(eng_c._execute(eng_c.hedge, eng_c.entropy, p_in))
+    approx(eng_c._inv_signed_qty, -1.0, tol=1e-9)
+
+    eng_c.entropy.set_book(100.07, 100.08)
+    eng_c.hedge.set_book(100.00, 100.01)
+    eng_c.entropy.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 1.0,
+                                     "avg_px": 100.08, "err": None, "unresolved": False, "client_order_id": "rc-e2"}]
+    eng_c.hedge.send_responses = [{"status": "timeout", "outcome": "unknown", "filled_base": 0.0,
+                                   "avg_px": None, "err": "timeout", "unresolved": True, "client_order_id": "rc-h2"}]
+    asyncio.run(eng_c._execute(eng_c.entropy, eng_c.hedge, p_out, reduce_only=True))
+    # Entry basis MUST remain intact until the pending closing leg settles!
+    approx(eng_c._inv_signed_qty, -1.0, tol=1e-9)
+
+    # Simulate process restart before pending reconcile completes
+    eng_c2 = make_engine(extra_c, midline=0.0, upper=2.0, lower=2.0, leg_slip=2.0)
+    assert eng_c2.load_state() is True
+    approx(eng_c2._inv_signed_qty, -1.0, tol=1e-9)
+    eng_c2.entropy.set_book(100.07, 100.08)
+    eng_c2.hedge.set_book(100.00, 100.01)
+    eng_c2.hedge.order_queries["rc-h2"] = {
+        "status": "filled", "outcome": "filled", "filled_base": 1.0,
+        "avg_px": 100.00, "err": None, "unresolved": False, "client_order_id": "rc-h2",
+    }
+    eng_c2.entropy.chain_position = 0.0
+    eng_c2.hedge.chain_position = 0.0
+    assert asyncio.run(eng_c2._reconcile_pending_orders()) is True
+    approx(eng_c2.circuit_breaker.daily_realized_pnl_usd, -0.03, tol=1e-6)
+    assert eng_c2.circuit_breaker.consecutive_losses == 1
+    approx(eng_c2._inv_signed_qty, 0.0, tol=1e-9)
+
+    # Sub-case D: Drift adoption to flat resets inventory cost basis immediately
+    eng_d = make_engine(midline=0.0, upper=2.0, lower=2.0, leg_slip=2.0)
+    eng_d.entropy.position = -0.5
+    eng_d.hedge.position = 0.5
+    eng_d._inv_signed_qty = -0.5
+    eng_d._inv_avg_cash = 0.05
+    eng_d._inv_avg_booked = 0.05
+    eng_d.entropy.last_traded_ts = 0.0
+    eng_d.entropy.chain_position = 0.0
+    asyncio.run(eng_d._reconcile_venue(eng_d.entropy, False))
+    approx(eng_d.entropy.position, 0.0, tol=1e-9)
+    approx(eng_d._inv_signed_qty, 0.0, tol=1e-9)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

@@ -266,10 +266,12 @@ class Engine:
         purpose: str,
         reduce_only: bool,
         persist: bool = True,
+        pair_id: Optional[str] = None,
+        pair_ctx: Optional[Dict[str, Any]] = None,
     ) -> str:
         cid = str(client_order_id or f"unknown-{int(time.time() * 1000)}")
         okey = f"{venue.key}:{cid}"
-        self._pending_orders[okey] = {
+        rec: Dict[str, Any] = {
             "venue_key": venue.key,
             "venue_name": venue.name,
             "client_order_id": cid,
@@ -282,6 +284,11 @@ class Engine:
             "submission": "attempted",
             "created_ts": time.time(),
         }
+        if pair_id is not None:
+            rec["pair_id"] = pair_id
+        if pair_ctx is not None:
+            rec["pair_ctx"] = pair_ctx
+        self._pending_orders[okey] = rec
         self._reconcile_required = True
         self._armed["sell_entropy"] = None
         self._armed["buy_entropy"] = None
@@ -332,6 +339,10 @@ class Engine:
                 "submission": submission,
                 "created_ts": time.time(),
             }
+        if purpose == "arb" and len(staged) == 2:
+            stage_pair_id = ":".join(sorted(staged.keys()))
+            for rec in staged.values():
+                rec["pair_id"] = stage_pair_id
         self._pending_orders.update(staged)
         if ids and not self.save_state():
             # No order has been sent. If the write partially succeeded, keep
@@ -491,6 +502,8 @@ class Engine:
                     self._inv_signed_qty, self._inv_avg_cash, self._inv_avg_booked = sq, ac, ab
             except (TypeError, ValueError):
                 pass
+        if self.entropy is not None and self.hedge is not None and not self._pending_orders:
+            self._sync_inv_basis_to_positions(self.entropy.position, self.hedge.position)
         if self._reconcile_required:
             log.warning(
                 "restored %d unresolved pending order(s) — trading paused until reconciled",
@@ -1297,6 +1310,33 @@ class Engine:
             if self.has_pending_reconcile():
                 self._reconcile_evt.set()
 
+    @staticmethod
+    def _matched_inventory_signed(entropy_pos: float, hedge_pos: float) -> float:
+        """Signed matched pair inventory (positive = long Entropy / short Hedge)."""
+        if entropy_pos > 1e-12 and hedge_pos < -1e-12:
+            return min(entropy_pos, -hedge_pos)
+        if entropy_pos < -1e-12 and hedge_pos > 1e-12:
+            return -min(-entropy_pos, hedge_pos)
+        return 0.0
+
+    def _sync_inv_basis_to_positions(
+        self,
+        entropy_pos: Optional[float] = None,
+        hedge_pos: Optional[float] = None,
+    ) -> None:
+        """Clamp tracked inventory cost basis to actual matched positions (0 when flat)."""
+        if self.entropy is None or self.hedge is None:
+            return
+        e_pos = self.entropy.position if entropy_pos is None else float(entropy_pos)
+        h_pos = self.hedge.position if hedge_pos is None else float(hedge_pos)
+        real_matched = self._matched_inventory_signed(e_pos, h_pos)
+        if abs(real_matched) <= 1e-12 or self._inv_signed_qty * real_matched <= 0.0:
+            self._inv_signed_qty = 0.0
+            self._inv_avg_cash = 0.0
+            self._inv_avg_booked = 0.0
+        elif abs(self._inv_signed_qty) > abs(real_matched) + 1e-12:
+            self._inv_signed_qty = real_matched
+
     def _attribute_pair_pnl(
         self, buy, sell, matched: float, buy_px: float, sell_px: float,
         buy_fee_unit: float, sell_fee_unit: float,
@@ -1510,8 +1550,11 @@ class Engine:
             else self.effective_fee_bps(sell) / 1e4
         )
 
+        pre_e_pos = self.entropy.position if self.entropy is not None else 0.0
+        pre_h_pos = self.hedge.position if self.hedge is not None else 0.0
         actual_fee_total = est_fee_total = 0.0
         posted = {}
+        posted_px: Dict[str, float] = {}
         posted_est_fee: Dict[str, float] = {}
         for v, info, filled, cid, fallback_px, fee_rate, sign in (
             (buy, binfo, bfill, b_cid, buy_bound, b_fee_rate, 1),
@@ -1531,6 +1574,7 @@ class Engine:
             v.cash -= sign * filled * px + fee
             v.volume_usd += filled * px
             posted[v.key] = (filled, fee / filled)
+            posted_px[v.key] = float(px)
 
         if posted:
             self._ensure_daily_breakdown()
@@ -1553,9 +1597,10 @@ class Engine:
                 bt.add_done_callback(self._bg_tasks.discard)
 
         unresolved = False
-        for v, info, is_buy, bound in (
-            (buy, binfo, True, buy_bound),
-            (sell, sinfo, False, sell_bound),
+        pair_id = f"{b_cid or ''}:{s_cid or ''}:{int(now * 1000)}"
+        for v, info, is_buy, bound, other, other_is_buy in (
+            (buy, binfo, True, buy_bound, sell, False),
+            (sell, sinfo, False, sell_bound, buy, True),
         ):
             cid = info.get("client_order_id")
             key = f"{v.key}:{cid}" if cid is not None else None
@@ -1564,10 +1609,20 @@ class Engine:
                 self._pending_orders[key]["known_filled"] = known_fill
             if info.get("unresolved"):
                 unresolved = True
+                pair_ctx = None
+                if other.key in posted and other.key in posted_px:
+                    other_filled, other_fee_unit = posted[other.key]
+                    pair_ctx = {
+                        "sibling_venue": other.key,
+                        "sibling_is_buy": other_is_buy,
+                        "sibling_filled": other_filled,
+                        "sibling_px": posted_px[other.key],
+                        "sibling_fee_unit": other_fee_unit,
+                    }
                 self._register_pending_order(
                     v, cid, is_buy=is_buy, qty=qty, limit_px=bound,
                     known_filled=known_fill, purpose="arb", reduce_only=send_reduce_only,
-                    persist=False,
+                    persist=False, pair_id=pair_id, pair_ctx=pair_ctx,
                 )
             elif key is not None:
                 self._mark_order_settled(key)
@@ -1579,6 +1634,7 @@ class Engine:
         pnl_delta = 0.0
         streak_pnl = 0.0
         if matched > 0 and binfo.get("avg_px") and sinfo.get("avg_px"):
+            self._sync_inv_basis_to_positions(pre_e_pos, pre_h_pos)
             gross_spread = matched * (sinfo["avg_px"] - binfo["avg_px"])
             fill_edge = gross_spread - matched * (buy_fee_unit + sell_fee_unit)
             pnl_delta, streak_pnl = self._attribute_pair_pnl(
@@ -1588,6 +1644,8 @@ class Engine:
             self.total_fill_edge += fill_edge
             # P1-4: record daily PnL breakdown
             self.daily_pnl_breakdown["spread_pnl_usd"] += gross_spread
+        elif not unresolved:
+            self._sync_inv_basis_to_positions()
 
         log.info("[SETTLED] %s: buy %s %s %.6g/%.6g | sell %s %s %.6g/%.6g | "
                  "matched %.6g | fill edge $%.4f (actFee=$%.4f estFee=$%.4f)",
@@ -1833,6 +1891,7 @@ class Engine:
                             made_progress = True
                             self._hedge_attempt_count = 0
                             v.position += -fill if is_sell else fill
+                            self._sync_inv_basis_to_positions()
                             px = info.get("avg_px") or limit
                             fee = self.effective_fee_bps(v) / 1e4
                             v.cash += fill * px * (1.0 - fee) if is_sell \
@@ -1971,40 +2030,75 @@ class Engine:
             return None
 
         full_under = floor_step(abs(under.position), under_step)
-        if abs(under.position) * under_limit < min_ntl_under and math.isclose(
-                max_q_under, full_under, rel_tol=0.0, abs_tol=1e-9):
+        full_over = floor_step(abs(over.position), over_step)
+        under_is_dust = (
+            abs(under.position) * under_limit < min_ntl_under
+            and math.isclose(max_q_under, full_under, rel_tol=0.0, abs_tol=1e-9)
+        )
+        if under_is_dust:
             q_under = full_under
             under_full = True
+            q_over = min(max_q_over, floor_step(q_under + abs(cur_net), over_step))
+            over_full = (
+                full_over >= over_step
+                and math.isclose(q_over, full_over, rel_tol=0.0, abs_tol=1e-9)
+            )
+        elif over_step > under_step + 1e-12:
+            # Coarser `over` venue, finer `under` venue (e.g. over=0.01, under=0.001,
+            # over=+0.50, under=-0.495, net=+0.005): anchor q_over on the coarser
+            # over_step grid and absorb the fine residual into q_under = q_over - delta.
+            raw_min_under = max(under.min_base, min_ntl_under / under_limit)
+            min_q_under = round(math.ceil(raw_min_under / under_step - 1e-9) * under_step, 12)
+            raw_min_over = max(over.min_base, min_ntl_over / over_limit)
+            min_q_over = round(math.ceil(raw_min_over / over_step - 1e-9) * over_step, 12)
+            if min_q_under > max_q_under + 1e-12 or min_q_over > max_q_over + 1e-12:
+                return None
+            exact_q_over = max(
+                min_q_over,
+                round(math.ceil((min_q_under + abs(cur_net)) / over_step - 1e-9) * over_step, 12),
+            )
+            if exact_q_over <= max_q_over + 1e-12:
+                q_over = exact_q_over
+                q_under = floor_step(q_over - abs(cur_net), under_step)
+            else:
+                q_over = max_q_over
+                q_under = max(min_q_under, floor_step(q_over - abs(cur_net), under_step))
+            q_under = min(q_under, max_q_under)
+            under_full = (
+                full_under >= under_step
+                and math.isclose(q_under, full_under, rel_tol=0.0, abs_tol=1e-9)
+            )
+            over_full = (
+                full_over >= over_step
+                and math.isclose(q_over, full_over, rel_tol=0.0, abs_tol=1e-9)
+            )
         else:
             raw_min_under = max(under.min_base, min_ntl_under / under_limit)
             q_under = round(math.ceil(raw_min_under / under_step - 1e-9) * under_step, 12)
             under_full = False
             if q_under > max_q_under + 1e-12:
                 return None
+            q_over = min(max_q_over, floor_step(q_under + abs(cur_net), over_step))
+            over_full = (
+                full_over >= over_step
+                and math.isclose(q_over, full_over, rel_tol=0.0, abs_tol=1e-9)
+            )
+            if not over_full and q_over * over_limit < min_ntl_over:
+                raw_min_over = max(over.min_base, min_ntl_over / over_limit)
+                bumped_over = round(math.ceil(raw_min_over / over_step - 1e-9) * over_step, 12)
+                delta_target = floor_step(abs(cur_net), over_step)
+                if delta_target <= 0.0:
+                    return None
+                bumped_under = floor_step(bumped_over - delta_target, under_step)
+                if (bumped_over <= max_q_over + 1e-12
+                        and bumped_under <= max_q_under + 1e-12
+                        and bumped_under >= under.min_base
+                        and bumped_under * under_limit >= min_ntl_under):
+                    q_over = bumped_over
+                    q_under = bumped_under
+                else:
+                    return None
 
-        desired_q_over = min(max_q_over, floor_step(q_under + abs(cur_net), over_step))
-        full_over = floor_step(abs(over.position), over_step)
-        over_full = (
-            full_over >= over_step
-            and math.isclose(desired_q_over, full_over, rel_tol=0.0, abs_tol=1e-9)
-        )
-        if not over_full and desired_q_over * over_limit < min_ntl_over:
-            raw_min_over = max(over.min_base, min_ntl_over / over_limit)
-            bumped_over = round(math.ceil(raw_min_over / over_step - 1e-9) * over_step, 12)
-            delta_target = floor_step(abs(cur_net), over_step)
-            if delta_target <= 0.0:
-                return None
-            bumped_under = floor_step(bumped_over - delta_target, under_step)
-            if (bumped_over <= max_q_over + 1e-12
-                    and bumped_under <= max_q_under + 1e-12
-                    and bumped_under >= under.min_base
-                    and bumped_under * under_limit >= min_ntl_under):
-                desired_q_over = bumped_over
-                q_under = bumped_under
-            else:
-                return None
-
-        q_over = desired_q_over
         if q_over <= q_under + 1e-12:
             return None
         if not over_full and (q_over < over.min_base or q_over * over_limit < min_ntl_over):
@@ -2109,6 +2203,7 @@ class Engine:
 
             if not self._commit_orders(ids, ((over, over_info), (under, under_info))):
                 return (False, True, "state checkpoint failed")
+            self._sync_inv_basis_to_positions()
             if unresolved:
                 return (False, True, "unresolved")
 
@@ -2221,10 +2316,12 @@ class Engine:
 
         # Commit the ledger and clear the journal together. A crash before the
         # replacement replays from the previous ledger with its pending IDs.
+        pre_positions = {k: v.position for k, v in self.venues.items()}
         self._ensure_daily_breakdown()
+        settled_arb_legs: List[Tuple[Any, Dict[str, Any], float, float, float]] = []
         for key, venue, rec, result, additional in settlements:
             if self._mark_order_settled(key) and additional > 0:
-                px = result.get("avg_px") or rec["limit_px"]
+                px = float(result.get("avg_px") or rec["limit_px"])
                 if result.get("fee_usd") is not None:
                     fee_usd = result["fee_usd"] * additional / result["filled_base"]
                     self.daily_pnl_breakdown["actual_fee_usd"] += fee_usd
@@ -2233,7 +2330,79 @@ class Engine:
                     self.daily_pnl_breakdown["estimated_fee_usd"] += fee_usd
                 venue.cash += (-1 if rec["is_buy"] else 1) * additional * px - fee_usd
                 venue.volume_usd += additional * px
+                if rec.get("purpose") == "arb":
+                    settled_arb_legs.append((venue, rec, additional, px, fee_usd / additional))
             venue.position = expected[venue.key]
+
+        # Attribute late-settled arb pairs through the exact same inventory cost-basis
+        # attribution as synchronous fills so round-trip PnL & consecutive losses stay exact.
+        attributed_pair_ids: set = set()
+        by_pair_id: Dict[str, List[Tuple[Any, Dict[str, Any], float, float, float]]] = {}
+        for item in settled_arb_legs:
+            pid = item[1].get("pair_id")
+            if pid:
+                by_pair_id.setdefault(pid, []).append(item)
+
+        def _post_late_pair(buy_v, sell_v, m_qty, b_px, s_px, b_fee_u, s_fee_u, pre_e, pre_h):
+            if m_qty <= 0.0:
+                return
+            self._sync_inv_basis_to_positions(pre_e, pre_h)
+            pnl_delta, streak_pnl = self._attribute_pair_pnl(
+                buy_v, sell_v, m_qty, b_px, s_px, b_fee_u, s_fee_u)
+            gross_spread = m_qty * (s_px - b_px)
+            fill_edge = gross_spread - m_qty * (b_fee_u + s_fee_u)
+            self.total_fill_edge += fill_edge
+            self.daily_pnl_breakdown["spread_pnl_usd"] += gross_spread
+            tripped, reason = self.circuit_breaker.record_trade_pnl(
+                pnl_delta, mtm_pnl_usd=self.daily_mtm_pnl(), streak_pnl_usd=streak_pnl)
+            self._handle_loss_breaker(tripped, reason)
+
+        for pid, items in by_pair_id.items():
+            if len(items) == 2 and items[0][1]["is_buy"] != items[1][1]["is_buy"]:
+                b_item = items[0] if items[0][1]["is_buy"] else items[1]
+                s_item = items[1] if items[0][1]["is_buy"] else items[0]
+                m_qty = min(b_item[2], s_item[2])
+                _post_late_pair(
+                    b_item[0], s_item[0], m_qty, b_item[3], s_item[3],
+                    b_item[4], s_item[4],
+                    pre_positions.get("entropy", 0.0), pre_positions.get("hedge", 0.0),
+                )
+                attributed_pair_ids.add(pid)
+
+        for venue, rec, additional, px, fee_unit in settled_arb_legs:
+            pid = rec.get("pair_id")
+            if pid and pid in attributed_pair_ids:
+                continue
+            pctx = rec.get("pair_ctx")
+            if not isinstance(pctx, dict):
+                continue
+            sib = self.venues.get(pctx.get("sibling_venue"))
+            if sib is None or bool(pctx.get("sibling_is_buy")) == bool(rec["is_buy"]):
+                continue
+            sib_rem = max(
+                0.0,
+                float(pctx.get("sibling_filled") or 0.0) - float(rec.get("known_filled") or 0.0),
+            )
+            m_qty = min(additional, sib_rem)
+            if m_qty <= 0.0:
+                continue
+            # Pre-pair positions exclude the sibling's already-posted fill so clamping
+            # matches the state right before this arb pair executed.
+            sib_signed = sib_rem * (1.0 if pctx["sibling_is_buy"] else -1.0)
+            pre_e = pre_positions.get("entropy", 0.0) - (sib_signed if sib.key == "entropy" else 0.0)
+            pre_h = pre_positions.get("hedge", 0.0) - (sib_signed if sib.key == "hedge" else 0.0)
+            if rec["is_buy"]:
+                _post_late_pair(
+                    venue, sib, m_qty, px, float(pctx["sibling_px"]),
+                    fee_unit, float(pctx.get("sibling_fee_unit") or 0.0), pre_e, pre_h,
+                )
+            else:
+                _post_late_pair(
+                    sib, venue, m_qty, float(pctx["sibling_px"]), px,
+                    float(pctx.get("sibling_fee_unit") or 0.0), fee_unit, pre_e, pre_h,
+                )
+
+        self._sync_inv_basis_to_positions()
         self._pending_orders.clear()
         self._pending_not_found_counts.clear()
         self._reconcile_required = False
@@ -2463,6 +2632,7 @@ class Engine:
                 if mid is not None:
                     v.cash -= delta * mid
                 v.position = r
+                self._sync_inv_basis_to_positions()
                 if self.state_store is not None and not self.save_state():
                     self._stop_on_state_error("could not checkpoint reconciled position drift")
 
