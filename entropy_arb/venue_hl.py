@@ -290,6 +290,11 @@ class HLVenue:
     def state_identity(self) -> str:
         return f"{self.api_url}/{self._query_address()}/{self.coin}"
 
+    def signer_identity(self) -> Optional[str]:
+        if self.account is None:
+            return None
+        return f"hl-signer:{self.api_url}/{self.account.wallet.address.lower()}"
+
     def reserve_order_id(self) -> str:
         return f"0x{uuid4().hex}"
 

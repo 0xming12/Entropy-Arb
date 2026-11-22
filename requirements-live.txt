@@ -7,8 +7,9 @@ hyperliquid-python-sdk>=0.9
 eth-account>=0.10
 
 # Lighter signing (only needed with --hedge lighter / lighter-rh).
-# Installs from the SDK's current main; for reproducible deploys, append a
-# known-good commit: ...lighter-python.git@<commit-sha>
-# 仅当 --hedge 为 lighter / lighter-rh 时需要。默认安装 SDK 最新主分支；
-# 如需可复现部署，可在末尾固定 commit：...lighter-python.git@<commit-sha>
-lighter-sdk @ git+https://github.com/elliottech/lighter-python.git
+# Pinned to an immutable commit SHA (never install floating main HEAD for a signing SDK).
+# Audit upstream commits before updating this SHA:
+#   https://github.com/elliottech/lighter-python/commits/main
+# 仅当 --hedge 为 lighter / lighter-rh 时需要。已固定为不可变 commit SHA，
+# 避免签名 SDK 随主分支浮动引入破坏性或恶意变更；升级前请先审计目标 commit。
+lighter-sdk @ git+https://github.com/elliottech/lighter-python.git@71dc79cd3cd499825f88b01adede2fe8aa183955

@@ -526,25 +526,37 @@ class Engine:
     # ------------------------------------------------------------- lifecycle
 
     def _acquire_venue_locks(self) -> None:
-        """Acquire exclusive file locks keyed on every venue's account+market identity.
+        """Acquire exclusive file locks for every venue's market identity and signer.
 
         Locks live in a single fixed absolute directory (`~/.entropy-arb/locks`
         or `ENTROPY_ARB_LOCK_DIR`), independent of `persistence.state_dir` and
         CWD, so two live bots launched from different configs or directories
-        cannot concurrently trade the same shared account+coin position.
+        cannot concurrently trade the same shared account+coin position OR share
+        the same signing key's nonce stream across different symbols.
         """
         if self.record_only:
             return
-        identities = sorted({
-            v.state_identity() for v in self.venues.values()
-            if hasattr(v, "state_identity")
-        })
+        lock_specs: List[Tuple[str, str]] = []
+        seen: set = set()
+        for prefix, attr in (("venue", "state_identity"), ("signer", "signer_identity")):
+            for v in self.venues.values():
+                fn = getattr(v, attr, None)
+                if fn is None:
+                    continue
+                ident = fn()
+                if not ident:
+                    continue
+                key = (prefix, str(ident))
+                if key not in seen:
+                    seen.add(key)
+                    lock_specs.append(key)
+        lock_specs.sort()
         lock_dir = global_lock_dir()
         acquired: List[InstanceLock] = []
         try:
-            for ident in identities:
+            for prefix, ident in lock_specs:
                 digest = hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16]
-                path = os.path.join(lock_dir, f"venue_{digest}.lock")
+                path = os.path.join(lock_dir, f"{prefix}_{digest}.lock")
                 lk = InstanceLock(path, label=ident)
                 lk.acquire()
                 acquired.append(lk)

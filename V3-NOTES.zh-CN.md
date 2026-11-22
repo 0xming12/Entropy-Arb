@@ -30,8 +30,9 @@
 2. **小额残余 / 亚步长敞口全覆盖平仓（Medium）**：
    - 独立碎单全平：`_hedge_attempts()` 当单腿 `reduce_only` 补单可一次性全平该交易所残余仓位时，豁免 `min_order_notional`/`min_quote`。
    - 叠加在匹配仓位上的小额 / 亚 `_step` 残余：新增 `_try_rebalance_submin_hedge()`，通过**双腿非对称 `reduce_only` 再平衡**（超额腿多减、对侧腿按最小合规额减仓，双腿均严格满足 `min_quote <= notional <= max_order_notional`，大残余自动分片；当超额腿步长更粗、对侧腿步长更细时，以粗步长腿对齐网格并由细步长腿吸收细微残差）直接清零残余净敞口，不再长期锁死在 `REDUCE-ONLY`。
-3. **全局固定目录的账户+品种独占锁（Medium/Low）**：
-   - 实盘启动后对每个交易所的 `state_identity()`（如 `io:NVDA` + HL 主账户地址）在固定绝对路径 `~/.entropy-arb/locks`（可通过 `ENTROPY_ARB_LOCK_DIR` 覆盖）加 `venue_<hash>.lock` 独占文件锁，完全独立于各配置文件的 `state_dir` 与工作目录 `CWD`。
+3. **全局固定目录的账户+品种及签名密钥独占锁（Medium/Low）**：
+   - 实盘启动后在固定绝对路径 `~/.entropy-arb/locks`（可通过 `ENTROPY_ARB_LOCK_DIR` 覆盖）同时对每个交易所的 `state_identity()`（`venue_<hash>.lock`）与 `signer_identity()`（`signer_<hash>.lock`：HL 签名地址、Lighter `api_url/account_index/api_key_index`）加独占文件锁，完全独立于各配置文件的 `state_dir` 与工作目录 `CWD`。
+   - 既防止同账户同品种多实例冲突，也阻止不同品种的两个实盘进程共享同一签名私钥的 nonce 流导致互相作废订单（单进程内 `--hedge tradexyz` 双腿共享同一 HL 签名器自动去重不自锁；多品种并发需为每个进程分配独立 HL Agent 与 Lighter `API_KEY_INDEX`）。
 4. **动态中枢下的库存成本基准闭环归因与同步夹紧（Low）**：
    - 新增 `_attribute_pair_pnl()` 并在 `state.json` 中持久化 `inv_basis`（开仓净量、加权平均现金价差与已入账基准）；平仓时严格按真实闭环现金盈亏 `avg_entry_cash + close_cash` 计算 `daily_realized_pnl_usd` 与 `max_consecutive_losses`，消除 `dynamic_midline` 漂移导致的假盈利/漏计连亏问题。
    - 新增 `_sync_inv_basis_to_positions()` 在同步成交、单腿补单、非对称再平衡、链上仓位漂移采纳与重启加载时实时将成本基准夹紧到真实匹配持仓（空仓时清零），并将超时后在对账阶段延迟结案的套利腿统一送入同一闭环归因通道，防止成本基准漂移导致重复记亏或误清连亏计数。
@@ -58,7 +59,7 @@
    用 `tools/analyze.py` 计算并填入真实 `midline_bps`、`upper_bps`、`lower_bps`。
 2. **确认交易所账户前提**：
    - Hyperliquid：确认目标 HIP-3 标的（如 `io:NVDA`）的逐仓/杠杆设置与可用保证金；
-   - Lighter：建议在 `requirements-live.txt` 中锁定当前可正常工作的 `lighter-python` commit SHA。
+   - Lighter：`requirements-live.txt` 已将 `lighter-sdk` 固定到不可变 commit SHA（`71dc79cd3cd499825f88b01adede2fe8aa183955`），升级前请先审计上游变更。
 3. **小资金启动实盘**：
    ```bash
    cp config.live-test.example.yaml config.live.yaml
