@@ -615,6 +615,220 @@ def test_p1_5_unhedged_pending_order_emits_alert_and_proactive_reconnect_quiet()
     assert disconnects == []
 
 
+# ----------------------- Review fixes: HL agent verification, dust hedge, locks
+
+def test_review_high_hl_account_address_required_and_verified():
+    # 1. HLCreds.complete strictly requires valid 42-char 0x account_address
+    assert HLCreds("0x" + "1" * 64, None).complete is False
+    assert HLCreds("0x" + "1" * 64, "").complete is False
+    assert HLCreds("0x" + "1" * 64, "not-an-address").complete is False
+    assert HLCreds("0x" + "1" * 64, "0x" + "a" * 40).complete is True
+
+    # 2. verify_account() enforces userRole + extraAgents binding
+    signer_addr = "0x" + "1" * 40
+    main_addr = "0x" + "a" * 40
+    wrong_addr = "0x" + "b" * 40
+
+    def make_hl(query_addr):
+        conf = VenueConf(
+            key="entropy", kind="hl", label="ENTROPY", symbol="NVDA",
+            fee_bps=1.0, cap_usd=1000.0, orders_per_min=120, hl_dex="io",
+            hl_creds=HLCreds("0x" + "1" * 64, query_addr),
+        )
+        hl = HLVenue(conf, "https://api.hyperliquid.xyz", "wss://api.hyperliquid.xyz/ws",
+                     session=None, settle_timeout_sec=1.0)
+        hl.account = SimpleNamespace(
+            wallet=SimpleNamespace(address=signer_addr),
+            query_address=query_addr.lower(),
+        )
+        return hl
+
+    # Case A: valid approved agent -> passes
+    hl_ok = make_hl(main_addr)
+    future_ms = int((time.time() + 3600) * 1000)
+
+    async def info_agent_ok(payload):
+        if payload["type"] == "userRole":
+            return {"role": "agent", "data": {"user": main_addr}}
+        if payload["type"] == "extraAgents":
+            return [{"address": signer_addr, "validUntil": future_ms}]
+        raise AssertionError(payload)
+
+    hl_ok._info = info_agent_ok
+    asyncio.run(hl_ok.verify_account())
+
+    # Case B: agent address accidentally put into HL_ACCOUNT_ADDRESS -> MUST fail!
+    hl_self = make_hl(signer_addr)
+    hl_self._info = info_agent_ok
+    try:
+        asyncio.run(hl_self.verify_account())
+        raise AssertionError("expected mismatch RuntimeError")
+    except RuntimeError as e:
+        assert "HL_ACCOUNT_ADDRESS mismatch" in str(e)
+
+    # Case C: expired agent authorization -> MUST fail!
+    hl_exp = make_hl(main_addr)
+
+    async def info_agent_expired(payload):
+        if payload["type"] == "userRole":
+            return {"role": "agent", "data": {"user": main_addr}}
+        if payload["type"] == "extraAgents":
+            return [{"address": signer_addr, "validUntil": int((time.time() - 10) * 1000)}]
+        raise AssertionError(payload)
+
+    hl_exp._info = info_agent_expired
+    try:
+        asyncio.run(hl_exp.verify_account())
+        raise AssertionError("expected expired RuntimeError")
+    except RuntimeError as e:
+        assert "expired" in str(e)
+
+    # Case D: missing/unapproved role -> MUST fail!
+    hl_missing = make_hl(main_addr)
+
+    async def info_missing(payload):
+        return {"role": "missing"}
+
+    hl_missing._info = info_missing
+    try:
+        asyncio.run(hl_missing.verify_account())
+        raise AssertionError("expected missing role RuntimeError")
+    except RuntimeError as e:
+        assert "role" in str(e)
+
+    # Case E: main wallet with mismatched query_address -> MUST fail!
+    hl_user_mismatch = make_hl(wrong_addr)
+
+    async def info_user(payload):
+        return {"role": "user"}
+
+    hl_user_mismatch._info = info_user
+    try:
+        asyncio.run(hl_user_mismatch.verify_account())
+        raise AssertionError("expected user mismatch RuntimeError")
+    except RuntimeError as e:
+        assert "not an approved agent" in str(e)
+
+
+def test_review_medium_shared_entropy_venue_lock_blocks_overlapping_hedges():
+    tmp_dir = tempfile.mkdtemp(prefix="entropy_v3_vlock_")
+    extra = f'persistence:\n  enabled: true\n  state_dir: "{tmp_dir}"\n  lock_enabled: true\n'
+    eng_lighter = make_engine(extra, hedge="lighter")
+    eng_rh = make_engine(extra, hedge="lighter-rh")
+
+    shared_entropy_id = "https://api.hyperliquid.xyz/0x" + "a" * 40 + "/io:NVDA"
+    eng_lighter.entropy.state_identity = lambda: shared_entropy_id
+    eng_lighter.hedge.state_identity = lambda: "https://mainnet.zklighter.elliot.ai/10/15"
+    eng_rh.entropy.state_identity = lambda: shared_entropy_id
+    eng_rh.hedge.state_identity = lambda: "https://api.rh.lighter.xyz/10/15"
+
+    eng_lighter._acquire_venue_locks()
+    try:
+        try:
+            eng_rh._acquire_venue_locks()
+            raise AssertionError("expected shared Entropy coin lock contention")
+        except RuntimeError as e:
+            assert "already running" in str(e) and "io:NVDA" in str(e)
+        # Different symbol on same HL account MUST still be allowed
+        eng_other = make_engine(extra, hedge="lighter-rh")
+        eng_other.entropy.state_identity = lambda: "https://api.hyperliquid.xyz/0x" + "a" * 40 + "/io:SNDK"
+        eng_other.hedge.state_identity = lambda: "https://api.rh.lighter.xyz/10/99"
+        eng_other._acquire_venue_locks()
+        eng_other._release_venue_locks()
+    finally:
+        eng_lighter._release_venue_locks()
+
+    # Once released, the second instance acquires cleanly
+    eng_rh._acquire_venue_locks()
+    eng_rh._release_venue_locks()
+
+
+def test_review_low_not_found_expiry_requires_count_age_and_chain_match_plus_cli_tool():
+    from pathlib import Path
+    from tools.inspect_order_state import apply_supervised_recovery
+
+    tmp_dir = tempfile.mkdtemp(prefix="entropy_v3_nf_")
+    extra = f"""
+execution:
+  pending_not_found_expire_sec: 60.0
+persistence:
+  enabled: true
+  state_dir: "{tmp_dir}"
+"""
+    eng = make_engine(extra)
+    eng.entropy.set_book(100.0, 100.02)
+    eng.hedge.set_book(100.0, 100.02)
+    okey = eng._register_pending_order(
+        eng.hedge, "lt-ghost", is_buy=True, qty=1.0, limit_px=100.0,
+        known_filled=0.0, purpose="arb", reduce_only=False,
+    )
+    eng.hedge.order_queries["lt-ghost"] = {
+        "status": "not-found", "outcome": "unknown", "filled_base": 0.0,
+        "avg_px": None, "err": None, "unresolved": True, "client_order_id": "lt-ghost",
+    }
+
+    # Too young (age < 60s) -> stays paused even after 3 queries
+    for _ in range(3):
+        assert asyncio.run(eng._reconcile_pending_orders()) is False
+    assert eng.has_pending_reconcile() is True
+
+    # Age past expiry, but on-chain position DOES NOT match zero-fill -> MUST stay paused!
+    eng._pending_orders[okey]["created_ts"] = time.time() - 120.0
+    eng.hedge.chain_position = 1.0  # Actually filled on-chain!
+    assert asyncio.run(eng._reconcile_pending_orders()) is False
+    assert eng.has_pending_reconcile() is True
+
+    # On-chain positions strictly match zero-fill -> safely auto-resolves!
+    eng.hedge.chain_position = 0.0
+    eng.entropy.chain_position = 0.0
+    assert asyncio.run(eng._reconcile_pending_orders()) is True
+    assert eng.has_pending_reconcile() is False
+
+    # Supervised CLI recovery creates backup and removes pending order atomically
+    eng2 = make_engine(extra)
+    okey2 = eng2._register_pending_order(
+        eng2.hedge, "lt-manual", is_buy=True, qty=1.0, limit_px=100.0,
+        known_filled=0.0, purpose="arb", reduce_only=False,
+    )
+    state_file = Path(eng2._state_path)
+    report = apply_supervised_recovery(
+        state_file,
+        resolve_zero_fill=[okey2],
+        set_positions=["entropy=0.0", "hedge=0.0"],
+        clear_reconcile=True,
+    )
+    assert Path(report["backup"]).exists()
+    assert report["removed_pending"] == [okey2]
+    assert report["state"]["reconciliation_required"] is False
+    assert report["state"]["pending_orders"] == []
+
+
+def test_review_low_config_numeric_range_validations():
+    from entropy_arb.config import ConfigError
+
+    bad_snippets = [
+        ("logging:\n  status_interval_sec: 0\n", "status_interval_sec"),
+        ("execution:\n  reconcile_sec: 0\n", "reconcile_sec"),
+        ("execution:\n  staleness_sec: 0\n", "staleness_sec"),
+        ("execution:\n  venue_probe_sec: 0\n", "venue_probe_sec"),
+        ("execution:\n  net_tolerance_base: -0.01\n", "net_tolerance_base"),
+        ("execution:\n  max_consecutive_errors: 0\n", "max_consecutive_errors"),
+        ("execution:\n  pending_not_found_expire_sec: -5\n", "pending_not_found_expire_sec"),
+        ("entropy:\n  max_orders_per_min: 0\n", "max_orders_per_min"),
+        ("hedge:\n  taker_fee_bps: -1\n", "taker_fee_bps"),
+        ("inventory:\n  floor_frac: 1.0\n", "floor_frac"),
+    ]
+    for snippet, needle in bad_snippets:
+        f = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+        f.write("thresholds:\n  midline_bps: 0\n  upper_bps: 4\n  lower_bps: 4\n" + snippet)
+        f.close()
+        try:
+            load_config(f.name, NO_ENV, symbol="NVDA", hedge_venue="lighter")
+            raise AssertionError(f"expected ConfigError for {snippet!r}")
+        except ConfigError as e:
+            assert needle in str(e), f"{needle!r} not in {e}"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

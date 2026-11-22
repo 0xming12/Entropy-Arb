@@ -56,6 +56,7 @@ execution:
   reconcile_sec: 15.0          # on-chain position sync cadence / 常规链上持仓核对周期（恢复上游默认 15s；未决单走独立对账）
   venue_probe_sec: 30.0        # probe cadence for a down venue / 故障交易所探测周期
   http_keepalive_sec: 10.0     # keep order-path TLS warm; 0 = off / 订单链路保活
+  pending_not_found_expire_sec: 120.0 # 未决 IOC 连续查无此单且双边链上仓位吻合零成交时的安全自愈窗口（秒，0 = 仅人工工具解除）
 
 # ===================== RISK & CIRCUIT BREAKER / 实盘风控与熔断 ==============
 risk:
