@@ -48,7 +48,7 @@ from .config import Config
 from .notifier import TelegramNotifier
 from .recorder import MinuteRecorder
 from .risk import CircuitBreaker, SessionFilter, SessionState
-from .state import InstanceLock, StateStore
+from .state import InstanceLock, StateStore, global_lock_dir
 from .strategy import DynamicMidline, FundingSkew
 from .venue_hl import HLVenue
 from .venue_lighter import LighterVenue
@@ -172,6 +172,10 @@ class Engine:
         self._daily_mtm_day: Optional[str] = None
         self._daily_mtm_baseline: Optional[float] = None
         self.daily_pnl_breakdown: Dict[str, Any] = self._fresh_daily_breakdown(None)
+        # Inventory cost basis for exact round-trip PnL attribution under dynamic midline
+        self._inv_signed_qty: float = 0.0
+        self._inv_avg_cash: float = 0.0
+        self._inv_avg_booked: float = 0.0
 
         # P1 (T8): persistence & instance lock
         safe_pair = f"{cfg.symbol}_{cfg.hedge_venue}".replace("/", "_")
@@ -299,10 +303,19 @@ class Engine:
     def _stage_orders(self, orders, *, qty: float, purpose: str,
                       reduce_only: bool,
                       submission: str = "prepared") -> Optional[Dict[str, str]]:
-        """Record all client IDs in one durable write before submitting any leg."""
+        """Record all client IDs in one durable write before submitting any leg.
+
+        Each item in `orders` is `(venue, is_buy, limit_px)` (using shared `qty`)
+        or `(venue, is_buy, limit_px, leg_qty)` for asymmetric rebalance legs.
+        """
         ids = {}
         staged = {}
-        for venue, is_buy, limit_px in orders:
+        for item in orders:
+            if len(item) == 4:
+                venue, is_buy, limit_px, leg_qty = item
+            else:
+                venue, is_buy, limit_px = item
+                leg_qty = qty
             if not hasattr(venue, "reserve_order_id"):
                 continue
             cid = venue.reserve_order_id()
@@ -311,7 +324,7 @@ class Engine:
                 "venue_key": venue.key,
                 "client_order_id": cid,
                 "is_buy": is_buy,
-                "qty": qty,
+                "qty": float(leg_qty),
                 "limit_px": limit_px,
                 "known_filled": 0.0,
                 "purpose": purpose,
@@ -413,6 +426,11 @@ class Engine:
             "pending_orders": dict(self._pending_orders),
             "reconcile_required": bool(self._reconcile_required or self._pending_orders),
             "hedge_attempt_count": self._hedge_attempt_count,
+            "inv_basis": {
+                "signed_qty": self._inv_signed_qty,
+                "avg_cash": self._inv_avg_cash,
+                "avg_booked": self._inv_avg_booked,
+            },
         }
         return self.state_store.save(payload)
 
@@ -463,6 +481,16 @@ class Engine:
             data.get("reconcile_required", False) or self._pending_orders
         )
         self._hedge_attempt_count = max(0, int(data.get("hedge_attempt_count", 0)))
+        saved_basis = data.get("inv_basis")
+        if isinstance(saved_basis, dict):
+            try:
+                sq = float(saved_basis.get("signed_qty", 0.0))
+                ac = float(saved_basis.get("avg_cash", 0.0))
+                ab = float(saved_basis.get("avg_booked", 0.0))
+                if math.isfinite(sq) and math.isfinite(ac) and math.isfinite(ab):
+                    self._inv_signed_qty, self._inv_avg_cash, self._inv_avg_booked = sq, ac, ab
+            except (TypeError, ValueError):
+                pass
         if self._reconcile_required:
             log.warning(
                 "restored %d unresolved pending order(s) — trading paused until reconciled",
@@ -487,9 +515,10 @@ class Engine:
     def _acquire_venue_locks(self) -> None:
         """Acquire exclusive file locks keyed on every venue's account+market identity.
 
-        Prevents two live bots (e.g. --hedge lighter and --hedge lighter-rh for the
-        same symbol) from concurrently trading the same shared Entropy io:<symbol>
-        account position.
+        Locks live in a single fixed absolute directory (`~/.entropy-arb/locks`
+        or `ENTROPY_ARB_LOCK_DIR`), independent of `persistence.state_dir` and
+        CWD, so two live bots launched from different configs or directories
+        cannot concurrently trade the same shared account+coin position.
         """
         if self.record_only:
             return
@@ -497,11 +526,12 @@ class Engine:
             v.state_identity() for v in self.venues.values()
             if hasattr(v, "state_identity")
         })
+        lock_dir = global_lock_dir()
         acquired: List[InstanceLock] = []
         try:
             for ident in identities:
                 digest = hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16]
-                path = os.path.join(self.cfg.persistence.state_dir, f"venue_{digest}.lock")
+                path = os.path.join(lock_dir, f"venue_{digest}.lock")
                 lk = InstanceLock(path, label=ident)
                 lk.acquire()
                 acquired.append(lk)
@@ -1267,23 +1297,73 @@ class Engine:
             if self.has_pending_reconcile():
                 self._reconcile_evt.set()
 
-    def _midline_adjusted_edge_usd(
+    def _attribute_pair_pnl(
         self, buy, sell, matched: float, buy_px: float, sell_px: float,
         buy_fee_unit: float, sell_fee_unit: float,
-    ) -> float:
-        """Half-turn net edge measured relative to the current midline.
+    ) -> Tuple[float, float]:
+        """Attribute matched pair fill PnL using tracked inventory cost basis.
 
-        Equals exact cash fill_edge when midline_bps == 0, and prevents
-        persistent non-zero basis (e.g. midline = -25 bps) from counting normal
-        profitable entries as consecutive losses. Entry + exit sum identically
-        to realized round-trip PnL.
+        Returns `(pnl_delta_usd, streak_pnl_usd)`:
+        - Opening quantity is booked against the current midline (preventing
+          false consecutive losses when persistent midline != 0) and stored in
+          the weighted-average basis (`_inv_avg_cash`, `_inv_avg_booked`).
+        - Closing quantity computes exact realized round-trip cash PnL
+          `closing * (avg_entry_cash + close_cash)` (invariant to dynamic
+          midline drift and underlying price moves), reverses the entry-booked
+          portion so `entry_booked + close_delta == exact round-trip cash`, and
+          uses the real round-trip PnL for `max_consecutive_losses`.
         """
+        fee_per_unit = buy_fee_unit + sell_fee_unit
+        cash_per_unit = (sell_px - buy_px) - fee_per_unit
         mid = self.current_midline_bps() / 1e4
         if sell.key == "entropy":
-            gross = matched * (sell_px - buy_px * (1.0 + mid))
+            half_turn_per_unit = (sell_px - buy_px * (1.0 + mid)) - fee_per_unit
+            fill_sign = -1.0
         else:
-            gross = matched * (sell_px * (1.0 + mid) - buy_px)
-        return gross - matched * (buy_fee_unit + sell_fee_unit)
+            half_turn_per_unit = (sell_px * (1.0 + mid) - buy_px) - fee_per_unit
+            fill_sign = 1.0
+
+        cur_signed = self._inv_signed_qty
+        closing_qty = 0.0
+        if cur_signed * fill_sign < 0.0:
+            closing_qty = min(matched, abs(cur_signed))
+        opening_qty = matched - closing_qty
+
+        pnl_delta = 0.0
+        streak_pnl = 0.0
+
+        if closing_qty > 0.0:
+            rt_pnl = closing_qty * (self._inv_avg_cash + cash_per_unit)
+            close_delta = rt_pnl - closing_qty * self._inv_avg_booked
+            pnl_delta += close_delta
+            streak_pnl += rt_pnl
+            rem = abs(cur_signed) - closing_qty
+            if rem <= 1e-12:
+                self._inv_signed_qty = 0.0
+                self._inv_avg_cash = 0.0
+                self._inv_avg_booked = 0.0
+            else:
+                self._inv_signed_qty = math.copysign(rem, cur_signed)
+
+        if opening_qty > 0.0:
+            open_pnl = opening_qty * half_turn_per_unit
+            pnl_delta += open_pnl
+            # A pure opening fill has not closed a round trip yet: only count
+            # adverse slippage (< 0) as a loss; NEVER let a normal opening fill
+            # reset an active consecutive-loss streak from prior losing round trips!
+            if open_pnl < 0.0:
+                streak_pnl += open_pnl
+            prev_abs = abs(self._inv_signed_qty)
+            new_abs = prev_abs + opening_qty
+            self._inv_avg_cash = (
+                prev_abs * self._inv_avg_cash + opening_qty * cash_per_unit
+            ) / new_abs
+            self._inv_avg_booked = (
+                prev_abs * self._inv_avg_booked + opening_qty * half_turn_per_unit
+            ) / new_abs
+            self._inv_signed_qty = fill_sign * new_abs
+
+        return pnl_delta, streak_pnl
 
     async def _verify_fill_fee_bg(
         self, v, *, order_id, client_order_id, filled: float, est_fee_usd: float,
@@ -1496,11 +1576,12 @@ class Engine:
         posted_sell, sell_fee_unit = posted.get(sell.key, (0.0, 0.0))
         matched = min(posted_buy, posted_sell)
         fill_edge = 0.0
-        mid_adj_edge = 0.0
+        pnl_delta = 0.0
+        streak_pnl = 0.0
         if matched > 0 and binfo.get("avg_px") and sinfo.get("avg_px"):
             gross_spread = matched * (sinfo["avg_px"] - binfo["avg_px"])
             fill_edge = gross_spread - matched * (buy_fee_unit + sell_fee_unit)
-            mid_adj_edge = self._midline_adjusted_edge_usd(
+            pnl_delta, streak_pnl = self._attribute_pair_pnl(
                 buy, sell, matched, binfo["avg_px"], sinfo["avg_px"],
                 buy_fee_unit, sell_fee_unit,
             )
@@ -1558,7 +1639,10 @@ class Engine:
             self.total_exp_edge += matched_expected
         if matched > 0 and binfo.get("avg_px") and sinfo.get("avg_px"):
             tripped, reason = self.circuit_breaker.record_trade_pnl(
-                mid_adj_edge, mtm_pnl_usd=self.daily_mtm_pnl())
+                pnl_delta,
+                mtm_pnl_usd=self.daily_mtm_pnl(),
+                streak_pnl_usd=streak_pnl,
+            )
             self._handle_loss_breaker(tripped, reason)
 
         self._record_trade(direction, plan,
@@ -1791,14 +1875,25 @@ class Engine:
                 break
 
             if not tried_venue:
-                self._unhedgeable_until = time.monotonic() + max(cfg.hedge_retry_delay_sec, 2.0)
-                self._unhedgeable_snapshot = self._pos_snapshot()
-                self._skiplog("[HEDGE] net %+.6g; no venue can reduce it within freshness, "
-                              "rate or order-size limits", cur_net)
-                self.notifier.notify(
-                    "unhedgeable_position", f"Net exposure {cur_net:+.6g} could not be hedged; "
-                    "new entries remain paused")
-                return
+                rebal = await self._try_rebalance_submin_hedge(
+                    cur_net, eff_slip_bps, max_retries)
+                if rebal is not None:
+                    slices_sent += 1
+                    rebal_progress, should_return, rebal_err = rebal
+                    if rebal_err:
+                        last_err = rebal_err
+                    if should_return:
+                        return
+                    made_progress = rebal_progress
+                else:
+                    self._unhedgeable_until = time.monotonic() + max(cfg.hedge_retry_delay_sec, 2.0)
+                    self._unhedgeable_snapshot = self._pos_snapshot()
+                    self._skiplog("[HEDGE] net %+.6g; no venue can reduce it within freshness, "
+                                  "rate or order-size limits", cur_net)
+                    self.notifier.notify(
+                        "unhedgeable_position", f"Net exposure {cur_net:+.6g} could not be hedged; "
+                        "new entries remain paused")
+                    return
 
             rem_net = self._net_position()
             if abs(rem_net) <= cfg.net_tolerance_base:
@@ -1820,6 +1915,215 @@ class Engine:
                 f"(remaining net={rem_net:+.6g}, last={last_err}) — manual intervention required",
                 force=True,
             )
+
+    async def _try_rebalance_submin_hedge(
+        self, cur_net: float, eff_slip_bps: float, max_retries: int,
+    ) -> Optional[Tuple[bool, bool, str]]:
+        """Flatten a sub-min-notional or sub-step residual sitting on top of matched
+        inventory using a two-leg asymmetric reduce_only rebalance.
+
+        Returns None when not executable, else `(made_progress, should_return, last_err)`.
+        """
+        cfg = self.cfg
+        if len(self.venues) != 2:
+            return None
+        sgn = 1.0 if cur_net > 0 else -1.0
+        is_sell_over = cur_net > 0
+        over = next((v for v in self.venues.values() if v.position * sgn > 0), None)
+        under = next((v for v in self.venues.values() if v.position * sgn < 0), None)
+        if over is None or under is None:
+            return None
+        for v in (over, under):
+            if (v.key in self._venue_down or not v.ready_to_trade()
+                    or self._venue_limited(v) or not self._venue_rate_ok(v)
+                    or not v.book.is_fresh(cfg.staleness_sec)
+                    or self._vlock(v.key).locked()):
+                return None
+
+        slip = eff_slip_bps / 1e4
+        over_ref = over.book.best_bid() if is_sell_over else over.book.best_ask()
+        under_ref = under.book.best_ask() if is_sell_over else under.book.best_bid()
+        if over_ref is None or under_ref is None:
+            return None
+        over_limit = (
+            over.px_round(over_ref * (1.0 - slip), round_up=True)
+            if is_sell_over else over.px_round(over_ref * (1.0 + slip), round_up=False)
+        )
+        under_limit = (
+            under.px_round(under_ref * (1.0 + slip), round_up=False)
+            if is_sell_over else under.px_round(under_ref * (1.0 - slip), round_up=True)
+        )
+        if over_limit <= 0.0 or under_limit <= 0.0:
+            return None
+
+        over_step = 10 ** -over.size_decimals
+        under_step = 10 ** -under.size_decimals
+        over_order_px = max(over_ref, over_limit)
+        under_order_px = max(under_ref, under_limit)
+        min_ntl_over = max(cfg.min_order_notional, over.min_quote)
+        min_ntl_under = max(cfg.min_order_notional, under.min_quote)
+
+        max_q_under = floor_step(
+            min(abs(under.position), cfg.max_order_notional / under_order_px), under_step)
+        max_q_over = floor_step(
+            min(abs(over.position), cfg.max_order_notional / over_order_px), over_step)
+        if max_q_under <= 0.0 or max_q_over <= 0.0:
+            return None
+
+        full_under = floor_step(abs(under.position), under_step)
+        if abs(under.position) * under_limit < min_ntl_under and math.isclose(
+                max_q_under, full_under, rel_tol=0.0, abs_tol=1e-9):
+            q_under = full_under
+            under_full = True
+        else:
+            raw_min_under = max(under.min_base, min_ntl_under / under_limit)
+            q_under = round(math.ceil(raw_min_under / under_step - 1e-9) * under_step, 12)
+            under_full = False
+            if q_under > max_q_under + 1e-12:
+                return None
+
+        desired_q_over = min(max_q_over, floor_step(q_under + abs(cur_net), over_step))
+        full_over = floor_step(abs(over.position), over_step)
+        over_full = (
+            full_over >= over_step
+            and math.isclose(desired_q_over, full_over, rel_tol=0.0, abs_tol=1e-9)
+        )
+        if not over_full and desired_q_over * over_limit < min_ntl_over:
+            raw_min_over = max(over.min_base, min_ntl_over / over_limit)
+            bumped_over = round(math.ceil(raw_min_over / over_step - 1e-9) * over_step, 12)
+            delta_target = floor_step(abs(cur_net), over_step)
+            if delta_target <= 0.0:
+                return None
+            bumped_under = floor_step(bumped_over - delta_target, under_step)
+            if (bumped_over <= max_q_over + 1e-12
+                    and bumped_under <= max_q_under + 1e-12
+                    and bumped_under >= under.min_base
+                    and bumped_under * under_limit >= min_ntl_under):
+                desired_q_over = bumped_over
+                q_under = bumped_under
+            else:
+                return None
+
+        q_over = desired_q_over
+        if q_over <= q_under + 1e-12:
+            return None
+        if not over_full and (q_over < over.min_base or q_over * over_limit < min_ntl_over):
+            return None
+        if not under_full and (q_under < under.min_base or q_under * under_limit < min_ntl_under):
+            return None
+        if (q_over * over_order_px > cfg.max_order_notional + 1e-9
+                or q_under * under_order_px > cfg.max_order_notional + 1e-9):
+            return None
+
+        lock_keys = sorted({over.key, under.key})
+        acquired = []
+        try:
+            for k in lock_keys:
+                lk = self._vlock(k)
+                await lk.acquire()
+                acquired.append(lk)
+        except BaseException:
+            for lk in reversed(acquired):
+                lk.release()
+            raise
+
+        try:
+            over_buy = not is_sell_over
+            under_buy = is_sell_over
+            log.warning(
+                "[HEDGE REBALANCE] net %+.6g — %s %s %.6g @%.6g | %s %s %.6g @%.6g (RO, slip<=%.1fbps)",
+                cur_net,
+                "BUY" if over_buy else "SELL", over.name, q_over, over_limit,
+                "BUY" if under_buy else "SELL", under.name, q_under, under_limit,
+                eff_slip_bps,
+            )
+            ids = self._stage_orders(
+                ((over, over_buy, over_limit, q_over),
+                 (under, under_buy, under_limit, q_under)),
+                qty=q_over, purpose="hedge_rebalance", reduce_only=True,
+                submission="attempted",
+            )
+            if ids is None:
+                return (False, True, "state journal unavailable")
+            self.hedges += 1
+            self._record_send(over)
+            self._record_send(under)
+            self._orders_in_flight += 1
+            try:
+                over_info, under_info = await asyncio.gather(
+                    self._send_staged_order(over, ids, is_buy=over_buy, qty=q_over,
+                                            limit_px=over_limit, reduce_only=True),
+                    self._send_staged_order(under, ids, is_buy=under_buy, qty=q_under,
+                                            limit_px=under_limit, reduce_only=True),
+                )
+            finally:
+                self._orders_in_flight -= 1
+            over.last_traded_ts = under.last_traded_ts = time.time()
+
+            unresolved = False
+            last_err = ""
+            total_filled = 0.0
+            for v, info, is_buy, leg_qty, bound in (
+                (over, over_info, over_buy, q_over, over_limit),
+                (under, under_info, under_buy, q_under, under_limit),
+            ):
+                if info.get("unresolved"):
+                    unresolved = True
+                    self._register_pending_order(
+                        v, info.get("client_order_id"), is_buy=is_buy,
+                        qty=leg_qty, limit_px=bound, known_filled=0.0,
+                        purpose="hedge_rebalance", reduce_only=True, persist=False,
+                    )
+                    continue
+                if info.get("err"):
+                    last_err = str(info["err"])
+                    log.error("[HEDGE REBALANCE] %s: %s", v.name, last_err)
+                    if last_err.startswith("RATE_LIMITED"):
+                        self._mark_limited(v)
+                    self._reconcile_evt.set()
+                    continue
+                fill = float(info.get("filled_base") or 0.0)
+                cid = info.get("client_order_id")
+                okey = f"{v.key}:{cid}" if cid else ""
+                if fill > 0.0 and (not okey or self._mark_order_settled(okey)):
+                    total_filled += fill
+                    v.position += fill if is_buy else -fill
+                    px = info.get("avg_px") or bound
+                    fee = self.effective_fee_bps(v) / 1e4
+                    v.cash += -fill * px * (1.0 + fee) if is_buy else fill * px * (1.0 - fee)
+                    v.volume_usd += fill * px
+                    if ids and v.key in ids and f"{v.key}:{ids[v.key]}" in self._pending_orders:
+                        self._pending_orders[f"{v.key}:{ids[v.key]}"]["known_filled"] = fill
+                    mid = v.book.mid()
+                    if mid is not None:
+                        slip_pnl = (
+                            fill * (mid - px * (1.0 + fee))
+                            if is_buy else fill * (px * (1.0 - fee) - mid)
+                        )
+                        self._ensure_daily_breakdown()
+                        self.daily_pnl_breakdown["hedge_pnl_usd"] += slip_pnl
+                        tripped, reason = self.circuit_breaker.record_trade_pnl(
+                            slip_pnl, mtm_pnl_usd=self.daily_mtm_pnl(), count_streak=False,
+                        )
+                        self._handle_loss_breaker(tripped, reason)
+
+            if not self._commit_orders(ids, ((over, over_info), (under, under_info))):
+                return (False, True, "state checkpoint failed")
+            if unresolved:
+                return (False, True, "unresolved")
+
+            new_net = self._net_position()
+            reduced = abs(new_net) < abs(cur_net) - 1e-12
+            if reduced:
+                self._hedge_attempt_count = 0
+                return (True, False, last_err)
+            self._hedge_attempt_count += 1
+            if not last_err and total_filled <= 0.0:
+                last_err = f"zero fill ({over_info.get('status')}/{under_info.get('status')})"
+            return (False, False, last_err)
+        finally:
+            for lk in reversed(acquired):
+                lk.release()
 
     # --------------------------------------------------- P0-1 pending reconcile
 

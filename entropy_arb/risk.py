@@ -224,17 +224,21 @@ class CircuitBreaker:
         mtm_pnl_usd: Optional[float] = None,
         now: Optional[float | datetime] = None,
         count_streak: bool = True,
+        streak_pnl_usd: Optional[float] = None,
     ) -> Tuple[bool, str]:
         """Record a completed trade/hedge/funding realized PnL.
 
-        Returns (newly_tripped, reason).
+        `streak_pnl_usd` (optional) separates consecutive-loss attribution (e.g.
+        exact round-trip PnL on a closing fill) from the incremental delta added
+        to `daily_realized_pnl_usd`. Returns (newly_tripped, reason).
         """
         self.maybe_roll_day(now)
         self.daily_realized_pnl_usd += float(pnl_usd)
         if count_streak:
-            if pnl_usd < 0.0:
+            streak_val = float(pnl_usd if streak_pnl_usd is None else streak_pnl_usd)
+            if streak_val < 0.0:
                 self.consecutive_losses += 1
-            elif pnl_usd > 0.0:
+            elif streak_val > 0.0:
                 self.consecutive_losses = 0
 
         return self.check_losses(mtm_pnl_usd=mtm_pnl_usd, now=now)
