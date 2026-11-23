@@ -1064,24 +1064,36 @@ class Engine:
                 force=True,
             )
 
-    def book_age_limit(self) -> float:
+    def book_age_limit(self, *, reduce_only: bool = False) -> float:
+        if reduce_only:
+            return self.cfg.risk.max_reduce_book_age_sec
         limit = self.cfg.risk.max_book_age_sec
         return self.cfg.staleness_sec if self.record_only and limit <= 0.0 else limit
 
+    def _trade_book_fresh(self, venue, *, reduce_only: bool,
+                          now_mono: Optional[float] = None) -> bool:
+        if not venue.book.is_fresh(self.cfg.staleness_sec):
+            return False
+        limit = self.book_age_limit(reduce_only=reduce_only)
+        if limit <= 0.0:
+            return True
+        age = venue.book.age_mono(now_mono)
+        return age is not None and age <= limit
+
     def _check_book_age_guard(self, now_mono: Optional[float] = None, *,
-                              reconnect: bool = False) -> bool:
-        limit = self.book_age_limit()
+                              reconnect: bool = False, reduce_only: bool = False) -> bool:
+        limit = self.book_age_limit(reduce_only=reduce_only)
         if limit <= 0.0:
             return True
         ok = True
         for v in self.venues.values():
-            has_quotes = v.book.has_usable_quotes()
-            age = v.book.age_mono(now_mono)
-            if not has_quotes or age is None or age > limit:
+            if not self._trade_book_fresh(v, reduce_only=reduce_only, now_mono=now_mono):
                 ok = False
                 if not reconnect:
                     continue
-                age_s = "no usable quote" if not has_quotes or age is None else f"{age:.1f}s"
+                age = v.book.age_mono(now_mono)
+                age_s = ("feed not ready" if not v.book.is_fresh(self.cfg.staleness_sec)
+                         else "no usable quote" if age is None else f"{age:.1f}s")
                 self._skiplog("[%s] stale book (%s, age limit %.1fs)",
                               v.name, age_s, limit)
                 self.notifier.notify(
@@ -1092,13 +1104,27 @@ class Engine:
                     v.request_reconnect()
         return ok
 
+    def _book_watchdog_tick(self) -> None:
+        reduce_only = not self.record_only and self.is_reduce_only()
+        self._check_book_age_guard(reconnect=True, reduce_only=reduce_only)
+        # The first fresh snapshot may arrive during an unhedgeable cooldown.
+        # Wake the strategy after that cooldown even if no new update arrives.
+        net = self._net_position()
+        if (reduce_only and abs(net) > self.cfg.net_tolerance_base and not self.halted
+                and not self._state_fault and not self.has_pending_reconcile()
+                and not self._hedge_running and not self._hedge_retry_exhausted
+                and not self._is_unhedgeable_cooldown()
+                and any(v.position * net > 0 and self._trade_book_fresh(v, reduce_only=True)
+                        for v in self.venues.values())):
+            self._update_evt.set()
+
     async def _book_watchdog(self) -> None:
         """Check quote age even when neither feed emits an order-book event."""
         while not self.stop.is_set():
             try:
                 await asyncio.wait_for(self.stop.wait(), timeout=1.0)
             except asyncio.TimeoutError:
-                self._check_book_age_guard(reconnect=True)
+                self._book_watchdog_tick()
 
     # -------------------------------------------------------------- strategy
 
@@ -1217,8 +1243,11 @@ class Engine:
             self._reset_signal()
             return None
 
+        signal_time = time.monotonic() if now_mono is None else now_mono
         reduce_only_hint = self.is_reduce_only(now)
-        if not self._check_book_age_guard(now_mono) and not reduce_only_hint:
+        if not all(self._trade_book_fresh(venue, reduce_only=reduce_only_hint,
+                                          now_mono=signal_time)
+                   for venue in (self.entropy, self.hedge)):
             self._reset_signal()
             return None
 
@@ -1236,8 +1265,9 @@ class Engine:
 
         if (
             self.dynamic_midline.enabled
-            and self.entropy.book.is_fresh(cfg.staleness_sec)
-            and self.hedge.book.is_fresh(cfg.staleness_sec)
+            and all(self._trade_book_fresh(venue, reduce_only=False,
+                                           now_mono=signal_time)
+                    for venue in (self.entropy, self.hedge))
             and prem is not None
         ):
             self.dynamic_midline.update(prem, now=now)
@@ -1259,15 +1289,16 @@ class Engine:
         if reduce_only != self._signal_reduce_only:
             self._reset_signal()
             self._signal_reduce_only = reduce_only
-        signal_time = time.monotonic() if now_mono is None else now_mono
+        # A loss breaker can change the applicable age limit during this scan.
+        if reduce_only != reduce_only_hint and not all(
+            self._trade_book_fresh(venue, reduce_only=reduce_only, now_mono=signal_time)
+            for venue in (self.entropy, self.hedge)
+        ):
+            return None
 
         best = None
         for buy, sell, dkey in ((self.hedge, self.entropy, "sell_entropy"),
                                 (self.entropy, self.hedge, "buy_entropy")):
-            if not (buy.book.is_fresh(cfg.staleness_sec)
-                    and sell.book.is_fresh(cfg.staleness_sec)):
-                self._reset_signal(dkey)
-                continue
             if (not (buy.ready_to_trade() and sell.ready_to_trade()) or self._venue_down
                     or self._vlock(buy.key).locked() or self._vlock(sell.key).locked()
                     or self._venue_limited(buy) or self._venue_limited(sell)):
@@ -1451,35 +1482,33 @@ class Engine:
         cfg = self.cfg
         now = time.time()
         send_reduce_only = bool(reduce_only or self.is_reduce_only(now))
+        checked_at = time.monotonic()
+        order_type = "REDUCE" if send_reduce_only else "ENTRY"
         # Post-lock re-verification: state or books may have changed while waiting for locks.
         if (not (buy.ready_to_trade() and sell.ready_to_trade())
                 or self._venue_down
                 or self._venue_limited(buy) or self._venue_limited(sell)
-                or not (buy.book.is_fresh(cfg.staleness_sec)
-                        and sell.book.is_fresh(cfg.staleness_sec))):
+                or not all(self._trade_book_fresh(venue, reduce_only=send_reduce_only,
+                                                  now_mono=checked_at)
+                           for venue in (buy, sell))):
             log.warning("[PRE-SEND BLOCKED] %s %s/%s: venue readiness or book freshness changed",
-                        "REDUCE" if send_reduce_only else "ENTRY", buy.name, sell.name)
-            return False
-        if not send_reduce_only and not self._check_book_age_guard():
-            log.warning("[PRE-SEND BLOCKED] ENTRY %s/%s: book age exceeded limit after lock",
-                        buy.name, sell.name)
+                        order_type, buy.name, sell.name)
             return False
         prem = self.premium_bps()
         if cfg.risk.max_spread_bps > 0.0 and prem is not None and abs(prem) > cfg.risk.max_spread_bps:
             log.warning("[PRE-SEND BLOCKED] %s %s/%s: extreme spread %.2fbps after lock",
-                        "REDUCE" if send_reduce_only else "ENTRY", buy.name, sell.name, prem)
+                        order_type, buy.name, sell.name, prem)
             return False
         prepared = self._prepare_pair_order(buy, sell, plan, reduce_only=send_reduce_only, now=now)
         if prepared is None:
             log.warning("[BOUNDS BLOCKED] %s %s/%s: order failed final depth, spread, or size limits",
-                        "REDUCE" if send_reduce_only else "ENTRY", buy.name, sell.name)
+                        order_type, buy.name, sell.name)
             return False
         plan, buy_bound, sell_bound = prepared
         qty = plan.qty
 
         inv_bps = self._inv_add_bps(buy, sell)
         direction = "sell_entropy" if sell.key == "entropy" else "buy_entropy"
-        self.last_trade_ts = now
         log.info("[ARB] %s%s: BUY %s %.6g @<=%.6g | SELL %s @>=%.6g | "
                  "take $%.0f of $%.0f | prem %.2fbps | exp $%.4f",
                  direction, " [RO]" if send_reduce_only else "",
@@ -1495,6 +1524,17 @@ class Engine:
         )
         if ids is None:
             return False
+        checked_at = time.monotonic()
+        if not all(self._trade_book_fresh(venue, reduce_only=send_reduce_only,
+                                          now_mono=checked_at)
+                   for venue in (buy, sell)):
+            # No adapter was called. Checkpoint the removal of both known-unsent IDs.
+            not_submitted = {"unresolved": False}
+            self._commit_orders(ids, ((buy, not_submitted), (sell, not_submitted)))
+            log.warning("[PRE-SEND BLOCKED] %s %s/%s: book expired during order staging",
+                        order_type, buy.name, sell.name)
+            return False
+        self.last_trade_ts = now
         self._record_send(buy)
         self._record_send(sell)
         binfo, sinfo = await asyncio.gather(
@@ -1799,69 +1839,72 @@ class Engine:
                 self._reset_hedge_attempts()
                 return
             attempt = self._hedge_attempt_count + 1
-            is_sell = cur_net > 0
             sgn = 1.0 if cur_net > 0 else -1.0
             tried_venue = False
             made_progress = False
 
             for v in sorted(self.venues.values(),
                             key=lambda x: (self._venue_limited(x), -x.position * sgn)):
-                if v.position * sgn <= 0:
-                    continue
-                # Use connection freshness (staleness_sec), NOT max_book_age_sec, so a
-                # quiet live book never traps an unhedged directional exposure.
-                if (v.key in self._venue_down or not v.ready_to_trade()
-                        or self._venue_limited(v) or not self._venue_rate_ok(v)
-                        or not v.book.is_fresh(cfg.staleness_sec)):
-                    continue
                 lk = self._vlock(v.key)
                 if lk.locked():
                     continue
-                venue_step = 10 ** -v.size_decimals
-                closing_all_on_venue = abs(cur_net) >= abs(v.position) - 1e-9
-                step = min(self._step, venue_step) if closing_all_on_venue else self._step
-                qty = floor_step(min(abs(cur_net), abs(v.position)), step)
-                if qty <= 0.0:
-                    continue
-                ref = v.book.best_bid() if is_sell else v.book.best_ask()
-                if ref is None:
-                    continue
-                # P1-1: round conservatively INWARD so rounded limit never breaches slip cap
-                limit = (
-                    v.px_round(ref * (1.0 - slip), round_up=True)
-                    if is_sell
-                    else v.px_round(ref * (1.0 + slip), round_up=False)
-                )
-                order_price = max(ref, limit)
-                qty = floor_step(min(qty, cfg.max_order_notional / order_price), step)
-                # Both Hyperliquid and Lighter exempt a full-close reduce-only order
-                # from the $10 minimum notional rule when flattening residual dust.
-                full_venue_qty = floor_step(abs(v.position), venue_step)
-                is_full_close = (
-                    closing_all_on_venue
-                    and full_venue_qty >= venue_step
-                    and math.isclose(qty, full_venue_qty, rel_tol=0.0, abs_tol=1e-9)
-                )
-                min_base_req = venue_step if is_full_close else v.min_base
-                min_notional_ok = (
-                    is_full_close
-                    or qty * limit >= max(cfg.min_order_notional, v.min_quote)
-                )
-                if qty <= 0.0 or qty < min_base_req or not min_notional_ok:
-                    continue
-                tried_venue = True
                 await lk.acquire()
                 try:
+                    if self.stop.is_set() or self._state_fault or self.has_pending_reconcile():
+                        return
+                    cur_net = self._net_position()
+                    if abs(cur_net) <= cfg.net_tolerance_base:
+                        self._reset_hedge_attempts()
+                        return
+                    is_sell = cur_net > 0
+                    if (v.position * cur_net <= 0 or v.key in self._venue_down
+                            or not v.ready_to_trade() or self._venue_limited(v)
+                            or not self._venue_rate_ok(v)
+                            or not self._trade_book_fresh(v, reduce_only=True)):
+                        continue
+                    venue_step = 10 ** -v.size_decimals
+                    closing_all_on_venue = abs(cur_net) >= abs(v.position) - 1e-9
+                    step = min(self._step, venue_step) if closing_all_on_venue else self._step
+                    qty = floor_step(min(abs(cur_net), abs(v.position)), step)
+                    ref = v.book.best_bid() if is_sell else v.book.best_ask()
+                    if qty <= 0.0 or ref is None:
+                        continue
+                    # Round inward so the order's limit stays inside the slippage cap.
+                    limit = v.px_round(ref * (1.0 - slip) if is_sell else ref * (1.0 + slip),
+                                       round_up=is_sell)
+                    order_price = max(ref, limit)
+                    qty = floor_step(min(qty, cfg.max_order_notional / order_price), step)
+                    full_venue_qty = floor_step(abs(v.position), venue_step)
+                    is_full_close = (
+                        closing_all_on_venue
+                        and full_venue_qty >= venue_step
+                        and math.isclose(qty, full_venue_qty, rel_tol=0.0, abs_tol=1e-9)
+                    )
+                    min_base_req = venue_step if is_full_close else v.min_base
+                    min_notional_ok = (
+                        is_full_close
+                        or qty * limit >= max(cfg.min_order_notional, v.min_quote)
+                    )
+                    if (qty <= 0.0 or qty < min_base_req or not min_notional_ok
+                            or not self._trade_book_fresh(v, reduce_only=True)):
+                        continue
                     side_str = "SELL" if is_sell else "BUY"
-                    log.warning("[HEDGE %d/%d] net %+.6g — %s %.6g on %s @%.6g (slip<=%.1fbps)",
-                                attempt, max_retries, cur_net, side_str, qty, v.name,
-                                limit, eff_slip_bps)
                     ids = self._stage_orders(
                         ((v, not is_sell, limit),), qty=qty, purpose="hedge",
                         reduce_only=True, submission="attempted",
                     )
                     if ids is None:
                         return
+                    # The durable write can take long enough to age out this
+                    # quote. No adapter has been called, so the ID can be cleared.
+                    if not self._trade_book_fresh(v, reduce_only=True):
+                        if ids and not self._commit_orders(ids, ((v, {"unresolved": False}),)):
+                            return
+                        continue
+                    tried_venue = True
+                    log.warning("[HEDGE %d/%d] net %+.6g — %s %.6g on %s @%.6g (slip<=%.1fbps)",
+                                attempt, max_retries, cur_net, side_str, qty, v.name,
+                                limit, eff_slip_bps)
                     slices_sent += 1
                     self.hedges += 1
                     self._record_send(v)
@@ -1946,8 +1989,7 @@ class Engine:
                 break
 
             if not tried_venue:
-                rebal = await self._try_rebalance_submin_hedge(
-                    cur_net, eff_slip_bps, max_retries)
+                rebal = await self._try_rebalance_submin_hedge(eff_slip_bps)
                 if rebal is not None:
                     slices_sent += 1
                     rebal_progress, should_return, rebal_err = rebal
@@ -1957,6 +1999,14 @@ class Engine:
                         return
                     made_progress = rebal_progress
                 else:
+                    cur_net = self._net_position()
+                    if abs(cur_net) <= cfg.net_tolerance_base:
+                        self._reset_hedge_attempts()
+                        return
+                    if any(v.position and not self._trade_book_fresh(v, reduce_only=True)
+                           for v in self.venues.values()):
+                        self._skiplog("[HEDGE] net %+.6g; waiting for fresh quotes", cur_net)
+                        return
                     self._unhedgeable_until = time.monotonic() + max(cfg.hedge_retry_delay_sec, 2.0)
                     self._unhedgeable_snapshot = self._pos_snapshot()
                     self._skiplog("[HEDGE] net %+.6g; no venue can reduce it within freshness, "
@@ -1988,7 +2038,7 @@ class Engine:
             )
 
     async def _try_rebalance_submin_hedge(
-        self, cur_net: float, eff_slip_bps: float, max_retries: int,
+        self, eff_slip_bps: float,
     ) -> Optional[Tuple[bool, bool, str]]:
         """Flatten a sub-min-notional or sub-step residual sitting on top of matched
         inventory using a two-leg asymmetric reduce_only rebalance.
@@ -1998,151 +2048,145 @@ class Engine:
         cfg = self.cfg
         if len(self.venues) != 2:
             return None
-        sgn = 1.0 if cur_net > 0 else -1.0
-        is_sell_over = cur_net > 0
-        over = next((v for v in self.venues.values() if v.position * sgn > 0), None)
-        under = next((v for v in self.venues.values() if v.position * sgn < 0), None)
-        if over is None or under is None:
+        locks = [self._vlock(key) for key in sorted(self.venues)]
+        if any(lock.locked() for lock in locks):
             return None
-        for v in (over, under):
-            if (v.key in self._venue_down or not v.ready_to_trade()
-                    or self._venue_limited(v) or not self._venue_rate_ok(v)
-                    or not v.book.is_fresh(cfg.staleness_sec)
-                    or self._vlock(v.key).locked()):
-                return None
-
-        slip = eff_slip_bps / 1e4
-        over_ref = over.book.best_bid() if is_sell_over else over.book.best_ask()
-        under_ref = under.book.best_ask() if is_sell_over else under.book.best_bid()
-        if over_ref is None or under_ref is None:
-            return None
-        over_limit = (
-            over.px_round(over_ref * (1.0 - slip), round_up=True)
-            if is_sell_over else over.px_round(over_ref * (1.0 + slip), round_up=False)
-        )
-        under_limit = (
-            under.px_round(under_ref * (1.0 + slip), round_up=False)
-            if is_sell_over else under.px_round(under_ref * (1.0 - slip), round_up=True)
-        )
-        if over_limit <= 0.0 or under_limit <= 0.0:
-            return None
-
-        over_step = 10 ** -over.size_decimals
-        under_step = 10 ** -under.size_decimals
-        over_order_px = max(over_ref, over_limit)
-        under_order_px = max(under_ref, under_limit)
-        min_ntl_over = max(cfg.min_order_notional, over.min_quote)
-        min_ntl_under = max(cfg.min_order_notional, under.min_quote)
-
-        max_q_under = floor_step(
-            min(abs(under.position), cfg.max_order_notional / under_order_px), under_step)
-        max_q_over = floor_step(
-            min(abs(over.position), cfg.max_order_notional / over_order_px), over_step)
-        if max_q_under <= 0.0 or max_q_over <= 0.0:
-            return None
-
-        full_under = floor_step(abs(under.position), under_step)
-        full_over = floor_step(abs(over.position), over_step)
-        under_is_dust = (
-            abs(under.position) * under_limit < min_ntl_under
-            and math.isclose(max_q_under, full_under, rel_tol=0.0, abs_tol=1e-9)
-        )
-        if under_is_dust:
-            q_under = full_under
-            under_full = True
-            q_over = min(max_q_over, floor_step(q_under + abs(cur_net), over_step))
-            over_full = (
-                full_over >= over_step
-                and math.isclose(q_over, full_over, rel_tol=0.0, abs_tol=1e-9)
-            )
-        elif over_step > under_step + 1e-12:
-            # Coarser `over` venue, finer `under` venue (e.g. over=0.01, under=0.001,
-            # over=+0.50, under=-0.495, net=+0.005): anchor q_over on the coarser
-            # over_step grid and absorb the fine residual into q_under = q_over - delta.
-            raw_min_under = max(under.min_base, min_ntl_under / under_limit)
-            min_q_under = round(math.ceil(raw_min_under / under_step - 1e-9) * under_step, 12)
-            raw_min_over = max(over.min_base, min_ntl_over / over_limit)
-            min_q_over = round(math.ceil(raw_min_over / over_step - 1e-9) * over_step, 12)
-            if min_q_under > max_q_under + 1e-12 or min_q_over > max_q_over + 1e-12:
-                return None
-            exact_q_over = max(
-                min_q_over,
-                round(math.ceil((min_q_under + abs(cur_net)) / over_step - 1e-9) * over_step, 12),
-            )
-            if exact_q_over <= max_q_over + 1e-12:
-                q_over = exact_q_over
-                q_under = floor_step(q_over - abs(cur_net), under_step)
-            else:
-                q_over = max_q_over
-                q_under = max(min_q_under, floor_step(q_over - abs(cur_net), under_step))
-            q_under = min(q_under, max_q_under)
-            under_full = (
-                full_under >= under_step
-                and math.isclose(q_under, full_under, rel_tol=0.0, abs_tol=1e-9)
-            )
-            over_full = (
-                full_over >= over_step
-                and math.isclose(q_over, full_over, rel_tol=0.0, abs_tol=1e-9)
-            )
-        else:
-            raw_min_under = max(under.min_base, min_ntl_under / under_limit)
-            q_under = round(math.ceil(raw_min_under / under_step - 1e-9) * under_step, 12)
-            under_full = False
-            if q_under > max_q_under + 1e-12:
-                return None
-            q_over = min(max_q_over, floor_step(q_under + abs(cur_net), over_step))
-            over_full = (
-                full_over >= over_step
-                and math.isclose(q_over, full_over, rel_tol=0.0, abs_tol=1e-9)
-            )
-            if not over_full and q_over * over_limit < min_ntl_over:
-                raw_min_over = max(over.min_base, min_ntl_over / over_limit)
-                bumped_over = round(math.ceil(raw_min_over / over_step - 1e-9) * over_step, 12)
-                delta_target = floor_step(abs(cur_net), over_step)
-                if delta_target <= 0.0:
-                    return None
-                bumped_under = floor_step(bumped_over - delta_target, under_step)
-                if (bumped_over <= max_q_over + 1e-12
-                        and bumped_under <= max_q_under + 1e-12
-                        and bumped_under >= under.min_base
-                        and bumped_under * under_limit >= min_ntl_under):
-                    q_over = bumped_over
-                    q_under = bumped_under
-                else:
-                    return None
-
-        if q_over <= q_under + 1e-12:
-            return None
-        if not over_full and (q_over < over.min_base or q_over * over_limit < min_ntl_over):
-            return None
-        if not under_full and (q_under < under.min_base or q_under * under_limit < min_ntl_under):
-            return None
-        if (q_over * over_order_px > cfg.max_order_notional + 1e-9
-                or q_under * under_order_px > cfg.max_order_notional + 1e-9):
-            return None
-
-        lock_keys = sorted({over.key, under.key})
         acquired = []
         try:
-            for k in lock_keys:
-                lk = self._vlock(k)
-                await lk.acquire()
-                acquired.append(lk)
-        except BaseException:
-            for lk in reversed(acquired):
-                lk.release()
-            raise
+            for lock in locks:
+                await lock.acquire()
+                acquired.append(lock)
+            if self.stop.is_set() or self._state_fault or self.has_pending_reconcile():
+                return None
+            cur_net = self._net_position()
+            if abs(cur_net) <= cfg.net_tolerance_base:
+                return None
+            sgn = 1.0 if cur_net > 0 else -1.0
+            is_sell_over = cur_net > 0
+            over = next((v for v in self.venues.values() if v.position * sgn > 0), None)
+            under = next((v for v in self.venues.values() if v.position * sgn < 0), None)
+            if over is None or under is None:
+                return None
+            for v in (over, under):
+                if (v.key in self._venue_down or not v.ready_to_trade()
+                        or self._venue_limited(v) or not self._venue_rate_ok(v)
+                        or not self._trade_book_fresh(v, reduce_only=True)):
+                    return None
 
-        try:
+            slip = eff_slip_bps / 1e4
+            over_ref = over.book.best_bid() if is_sell_over else over.book.best_ask()
+            under_ref = under.book.best_ask() if is_sell_over else under.book.best_bid()
+            if over_ref is None or under_ref is None:
+                return None
+            over_limit = (
+                over.px_round(over_ref * (1.0 - slip), round_up=True)
+                if is_sell_over else over.px_round(over_ref * (1.0 + slip), round_up=False)
+            )
+            under_limit = (
+                under.px_round(under_ref * (1.0 + slip), round_up=False)
+                if is_sell_over else under.px_round(under_ref * (1.0 - slip), round_up=True)
+            )
+            if over_limit <= 0.0 or under_limit <= 0.0:
+                return None
+
+            over_step = 10 ** -over.size_decimals
+            under_step = 10 ** -under.size_decimals
+            over_order_px = max(over_ref, over_limit)
+            under_order_px = max(under_ref, under_limit)
+            min_ntl_over = max(cfg.min_order_notional, over.min_quote)
+            min_ntl_under = max(cfg.min_order_notional, under.min_quote)
+
+            max_q_under = floor_step(
+                min(abs(under.position), cfg.max_order_notional / under_order_px), under_step)
+            max_q_over = floor_step(
+                min(abs(over.position), cfg.max_order_notional / over_order_px), over_step)
+            if max_q_under <= 0.0 or max_q_over <= 0.0:
+                return None
+
+            full_under = floor_step(abs(under.position), under_step)
+            full_over = floor_step(abs(over.position), over_step)
+            under_is_dust = (
+                abs(under.position) * under_limit < min_ntl_under
+                and math.isclose(max_q_under, full_under, rel_tol=0.0, abs_tol=1e-9)
+            )
+            if under_is_dust:
+                q_under = full_under
+                under_full = True
+                q_over = min(max_q_over, floor_step(q_under + abs(cur_net), over_step))
+                over_full = (
+                    full_over >= over_step
+                    and math.isclose(q_over, full_over, rel_tol=0.0, abs_tol=1e-9)
+                )
+            elif over_step > under_step + 1e-12:
+                # Coarser `over` venue, finer `under` venue (e.g. over=0.01, under=0.001,
+                # over=+0.50, under=-0.495, net=+0.005): anchor q_over on the coarser
+                # over_step grid and absorb the fine residual into q_under = q_over - delta.
+                raw_min_under = max(under.min_base, min_ntl_under / under_limit)
+                min_q_under = round(math.ceil(raw_min_under / under_step - 1e-9) * under_step, 12)
+                raw_min_over = max(over.min_base, min_ntl_over / over_limit)
+                min_q_over = round(math.ceil(raw_min_over / over_step - 1e-9) * over_step, 12)
+                if min_q_under > max_q_under + 1e-12 or min_q_over > max_q_over + 1e-12:
+                    return None
+                exact_q_over = max(
+                    min_q_over,
+                    round(math.ceil((min_q_under + abs(cur_net)) / over_step - 1e-9) * over_step, 12),
+                )
+                if exact_q_over <= max_q_over + 1e-12:
+                    q_over = exact_q_over
+                    q_under = floor_step(q_over - abs(cur_net), under_step)
+                else:
+                    q_over = max_q_over
+                    q_under = max(min_q_under, floor_step(q_over - abs(cur_net), under_step))
+                q_under = min(q_under, max_q_under)
+                under_full = (
+                    full_under >= under_step
+                    and math.isclose(q_under, full_under, rel_tol=0.0, abs_tol=1e-9)
+                )
+                over_full = (
+                    full_over >= over_step
+                    and math.isclose(q_over, full_over, rel_tol=0.0, abs_tol=1e-9)
+                )
+            else:
+                raw_min_under = max(under.min_base, min_ntl_under / under_limit)
+                q_under = round(math.ceil(raw_min_under / under_step - 1e-9) * under_step, 12)
+                under_full = False
+                if q_under > max_q_under + 1e-12:
+                    return None
+                q_over = min(max_q_over, floor_step(q_under + abs(cur_net), over_step))
+                over_full = (
+                    full_over >= over_step
+                    and math.isclose(q_over, full_over, rel_tol=0.0, abs_tol=1e-9)
+                )
+                if not over_full and q_over * over_limit < min_ntl_over:
+                    raw_min_over = max(over.min_base, min_ntl_over / over_limit)
+                    bumped_over = round(math.ceil(raw_min_over / over_step - 1e-9) * over_step, 12)
+                    delta_target = floor_step(abs(cur_net), over_step)
+                    if delta_target <= 0.0:
+                        return None
+                    bumped_under = floor_step(bumped_over - delta_target, under_step)
+                    if (bumped_over <= max_q_over + 1e-12
+                            and bumped_under <= max_q_under + 1e-12
+                            and bumped_under >= under.min_base
+                            and bumped_under * under_limit >= min_ntl_under):
+                        q_over = bumped_over
+                        q_under = bumped_under
+                    else:
+                        return None
+
+            if q_over <= q_under + 1e-12:
+                return None
+            if not over_full and (q_over < over.min_base or q_over * over_limit < min_ntl_over):
+                return None
+            if not under_full and (q_under < under.min_base or q_under * under_limit < min_ntl_under):
+                return None
+            if (q_over * over_order_px > cfg.max_order_notional + 1e-9
+                    or q_under * under_order_px > cfg.max_order_notional + 1e-9):
+                return None
+
             over_buy = not is_sell_over
             under_buy = is_sell_over
-            log.warning(
-                "[HEDGE REBALANCE] net %+.6g — %s %s %.6g @%.6g | %s %s %.6g @%.6g (RO, slip<=%.1fbps)",
-                cur_net,
-                "BUY" if over_buy else "SELL", over.name, q_over, over_limit,
-                "BUY" if under_buy else "SELL", under.name, q_under, under_limit,
-                eff_slip_bps,
-            )
+            if not all(self._trade_book_fresh(v, reduce_only=True) for v in (over, under)):
+                return None
             ids = self._stage_orders(
                 ((over, over_buy, over_limit, q_over),
                  (under, under_buy, under_limit, q_under)),
@@ -2151,6 +2195,20 @@ class Engine:
             )
             if ids is None:
                 return (False, True, "state journal unavailable")
+            # Validate both legs together. If either quote expired during
+            # the journal write, neither order has been submitted.
+            if not all(self._trade_book_fresh(v, reduce_only=True) for v in (over, under)):
+                unsent = ((over, {"unresolved": False}), (under, {"unresolved": False}))
+                if ids and not self._commit_orders(ids, unsent):
+                    return (False, True, "state checkpoint failed")
+                return None
+            log.warning(
+                "[HEDGE REBALANCE] net %+.6g — %s %s %.6g @%.6g | %s %s %.6g @%.6g (RO, slip<=%.1fbps)",
+                cur_net,
+                "BUY" if over_buy else "SELL", over.name, q_over, over_limit,
+                "BUY" if under_buy else "SELL", under.name, q_under, under_limit,
+                eff_slip_bps,
+            )
             self.hedges += 1
             self._record_send(over)
             self._record_send(under)
@@ -2845,7 +2903,8 @@ class Engine:
                 await asyncio.sleep(cfg.status_interval_sec)
             except asyncio.CancelledError:
                 raise
-            age_limit = self.book_age_limit()
+            age_limit = self.book_age_limit(
+                reduce_only=not self.record_only and self.is_reduce_only())
             books = " | ".join(
                 f"{v.name} {v.book.best_bid() or '—'}/{v.book.best_ask() or '—'}"
                 + ("" if v.book.is_fresh(cfg.staleness_sec, max_book_age_sec=age_limit)

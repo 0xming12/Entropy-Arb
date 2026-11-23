@@ -1,5 +1,7 @@
 # Entropy Arb v3 实盘修复说明（基于 v2-order-guards）
 
+本地盘口时效修订基于上游提交 `ce3cd30`。
+
 本版本在 `entropy-arb-v2-order-guards` 的订单安全框架基础上，修复了阻碍小资金实盘测试的 4 个 P0 级高危缺陷与 5 组 P1 级执行/接口问题。
 
 ## 一、P0 级修复
@@ -41,7 +43,7 @@
    - 升级 `tools/inspect_order_state.py`，新增 `--resolve-zero-fill`、`--set-position`、`--clear-reconcile`（必须带 `--confirm`，修改前自动生成 `.bak.<ts>` 备份并原子写入）。
 5. **配置数值范围全量校验（Low）**：补齐 `status_interval_sec > 0`、`reconcile_sec > 0`、`staleness_sec > 0`、`venue_probe_sec > 0`、`max_orders_per_min >= 1`、`max_consecutive_errors >= 1`、`net_tolerance_base >= 0`、`inventory.floor_frac ∈ [0, 1)`、`taker_fee_bps >= 0`、`pending_not_found_expire_sec >= 0` 等边界校验。
 6. **释放 `latency_buffer_bps` 作为边界滑点空间**：正常入场的 `_worst_case_check()` / `_order_price_bounds()` 扣除 `latency_buffer_bps`，信号刚过门槛时两腿不再被压成 `0 bps` 贴盘口限价单。
-7. **清淡盘口不阻断减仓与补单**：`max_book_age_sec` 仅拦截开新仓并驱动 watchdog 重连，不再拦截 `reduce_only` 平仓与 `_hedge()` 补单；主动重连不再刷屏误报 WS 断线 Telegram 告警；示例配置默认值上调为 `30.0s`。
+7. **开仓和减仓分别检查盘口更新时间**。`max_book_age_sec` 用于开仓。`max_reduce_book_age_sec` 用于配对减仓、单腿补单和双腿再平衡，默认 15 秒，必须为正数。两种模式都检查连接状态。有心跳但盘口已过期时，程序会阻止委托并尝试重新订阅，取得新盘口后继续评估。若长时间拿不到新数据，残仓仍需要人工处理。
 8. **单腿补单优先级与分片计数优化**：`_evaluate()` 存在超容差裸敞口时优先执行 `_maybe_hedge()`（不受 `cooldown_sec` 阻挡）；`_hedge_attempt_count` 仅累计失败/零成交重试次数，大额敞口分多片正常成交不会误触停机。
 9. **Lighter 模糊错误分类与 SDK 兼容**：`create_order` 返回 `502/503/504/timeout/connection` 类错误字符串时一律判为 `unresolved: True` 进入 P0-1 对账；超时取消后尝试通知 `nonce_manager`；`query_order` 遇到 `AttributeError`/`TypeError` 自动降级到 `account_inactive_orders`。
 10. **HL Unified Account 可用保证金兼容 & 其他加固**：

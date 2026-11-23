@@ -66,7 +66,8 @@ risk:
   max_taker_fee_bps: 2.0               # Entropy 实时 Taker 费率上限（bps，查询失败时亦暂停新增风险）；0 = 关闭
   fee_check_interval_sec: 60.0         # 费率轮询间隔（秒，默认 60 秒；成交回执/userFills 亦会即时校验）
   reduce_only_ignore_session_buffer: true  # reduce_only 模式下减仓方向豁免休市缓冲，防止卡死平仓
-  max_book_age_sec: 30.0               # 盘口有效更新超时上限（秒，仅拦截开新仓并触发重连，不拦截减仓与补单；清淡标的建议 30~60s）；0 = 关闭
+  max_book_age_sec: 30.0               # 开仓盘口有效更新的最久等待时间（秒）；0 = 关闭此开仓限制
+  max_reduce_book_age_sec: 15.0        # 减仓、单腿补单和再平衡的盘口更新时间上限（秒，必须大于 0）
   max_spread_bps: 150.0                # 极端价差绝对值上限（bps），防范单所插针或预言机脱锚；0 = 关闭
   min_available_margin_usd: 100.0      # 单所可用保证金下限（美元，查询失败时亦暂停新增风险）；0 = 关闭
   reconcile_drift_reduce_only: true    # 定时对账发现本地与链上仓位偏差超过容差时自动切 reduce_only 并告警

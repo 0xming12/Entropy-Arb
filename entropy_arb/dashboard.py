@@ -203,7 +203,7 @@ class Dashboard:
         mode = Text(self._t(" RECORD-ONLY "), style="black on yellow") \
             if eng.record_only \
             else Text(self._t(" LIVE "), style="white on dark_green")
-        age_limit = eng.book_age_limit()
+        age_limit = eng.book_age_limit(reduce_only=not eng.record_only and eng.is_reduce_only())
         stale = sum(1 for v in eng.venues.values()
                     if not v.book.is_fresh(cfg.staleness_sec, max_book_age_sec=age_limit))
         limited = sum(1 for v in eng.venues.values() if eng._venue_limited(v))
@@ -241,7 +241,7 @@ class Dashboard:
 
     def _venues_panel(self):
         eng, cfg = self.eng, self.eng.cfg
-        age_limit = eng.book_age_limit()
+        age_limit = eng.book_age_limit(reduce_only=not eng.record_only and eng.is_reduce_only())
         t = Table(box=box.SIMPLE_HEAD, padding=(0, 1))
         for col, j in (("venue", "left"), ("bid / ask", "right"),
                        ("spr bps", "right"), ("age", "right"),

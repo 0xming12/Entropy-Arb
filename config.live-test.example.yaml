@@ -58,6 +58,7 @@ risk:
   fee_check_interval_sec: 60.0
   reduce_only_ignore_session_buffer: true
   max_book_age_sec: 30.0
+  max_reduce_book_age_sec: 15.0         # 心跳不能代替盘口更新，超时等待新报价再减仓
   max_spread_bps: 150.0
   min_available_margin_usd: 20.0         # 按你的小资金测试保证金下调，避免开机被锁死
   reconcile_drift_reduce_only: true
