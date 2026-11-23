@@ -256,9 +256,8 @@ class LighterVenue:
             from lighter import SignerClient
         except ImportError as e:
             raise RuntimeError(
-                "live trading on Lighter needs the official SDK — "
-                "pip install -r requirements-live.txt "
-                "(git+https://github.com/elliottech/lighter-python.git)") from e
+                "live trading on Lighter needs the pinned official SDK — "
+                "pip install -r requirements-live.txt") from e
         signer = SignerClient(
             url=self.profile.api_url,
             account_index=c.account_index,
@@ -329,6 +328,12 @@ class LighterVenue:
 
     def state_identity(self) -> str:
         return f"{self.profile.api_url}/{self.conf.lighter_creds.account_index}/{self.market_id}"
+
+    def signer_identity(self) -> Optional[str]:
+        c = self.conf.lighter_creds
+        if c is None or c.account_index is None or c.api_key_index is None:
+            return None
+        return f"lighter-signer:{self.profile.api_url}/{c.account_index}/{c.api_key_index}"
 
     def reserve_order_id(self) -> str:
         return str(self._next_coi())

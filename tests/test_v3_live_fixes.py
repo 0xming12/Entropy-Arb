@@ -1218,6 +1218,109 @@ persistence:
     approx(eng_d._inv_signed_qty, 0.0, tol=1e-9)
 
 
+def test_review4_low_signer_lock_blocks_shared_nonce_across_symbols():
+    from types import SimpleNamespace
+    from entropy_arb.config import HLCreds, LighterCreds, LIGHTER_PROFILES, VenueConf
+    from entropy_arb.venue_hl import HLVenue
+    from entropy_arb.venue_lighter import LighterVenue
+
+    lock_dir = tempfile.mkdtemp(prefix="entropy_v3_slock_")
+    orig_env = os.environ.get("ENTROPY_ARB_LOCK_DIR")
+    os.environ["ENTROPY_ARB_LOCK_DIR"] = lock_dir
+    try:
+        main_addr = "0x" + "1" * 40
+        agent_a = "0x" + "a" * 40
+        agent_b = "0x" + "b" * 40
+
+        def _make_pair(symbol, coin, market_id, hl_signer_addr, lt_key_idx, hedge="lighter"):
+            eng = make_engine(hedge=hedge)
+            e_vc = VenueConf(
+                key="entropy", kind="hl", label="ENTROPY", symbol=symbol,
+                hl_dex="io", cap_usd=100.0, fee_bps=1.0, orders_per_min=60,
+                hl_creds=HLCreds(private_key="0x" + "2" * 64, account_address=main_addr),
+            )
+            hl_v = HLVenue(e_vc, "https://api.hyperliquid.xyz", "wss://api.hyperliquid.xyz/ws", None, 5.0)
+            hl_v.coin = coin
+            hl_v.account = SimpleNamespace(
+                wallet=SimpleNamespace(address=hl_signer_addr),
+                query_address=main_addr,
+            )
+            if hedge == "tradexyz":
+                h_vc = VenueConf(
+                    key="hedge", kind="hl", label="XYZ", symbol=symbol,
+                    hl_dex="xyz", cap_usd=100.0, fee_bps=1.0, orders_per_min=60,
+                    hl_creds=HLCreds(private_key="0x" + "2" * 64, account_address=main_addr),
+                )
+                h_v = HLVenue(h_vc, "https://api.hyperliquid.xyz", "wss://api.hyperliquid.xyz/ws", None, 5.0)
+                h_v.coin = f"xyz:{symbol}"
+                h_v.account = SimpleNamespace(
+                    wallet=SimpleNamespace(address=hl_signer_addr),
+                    query_address=main_addr,
+                )
+            else:
+                h_vc = VenueConf(
+                    key="hedge", kind="lighter", label="LIGHTER", symbol=symbol,
+                    lighter_profile=LIGHTER_PROFILES["lighter"],
+                    cap_usd=100.0, fee_bps=0.0, orders_per_min=60,
+                    lighter_creds=LighterCreds(
+                        api_private_key="deadbeef", account_index=42, api_key_index=lt_key_idx,
+                    ),
+                )
+                h_v = LighterVenue(h_vc, None, 5.0)
+                h_v.market_id = market_id
+            eng.entropy, eng.hedge = hl_v, h_v
+            eng.venues = {"entropy": hl_v, "hedge": h_v}
+            return eng
+
+        # 1) Same Lighter (account_index=42, api_key_index=2) across DIFFERENT symbols -> BLOCKED!
+        eng_nvda = _make_pair("NVDA", "io:NVDA", 15, agent_a, lt_key_idx=2)
+        eng_tsla_same_lt = _make_pair("TSLA", "io:TSLA", 16, agent_b, lt_key_idx=2)
+        eng_nvda._acquire_venue_locks()
+        try:
+            try:
+                eng_tsla_same_lt._acquire_venue_locks()
+                raise AssertionError("expected shared Lighter signer lock contention")
+            except RuntimeError as e:
+                assert "already running" in str(e) and "lighter-signer:" in str(e)
+
+            # 2) Same HL signer across DIFFERENT symbols (even with different Lighter key) -> BLOCKED!
+            eng_tsla_same_hl = _make_pair("TSLA", "io:TSLA", 16, agent_a, lt_key_idx=3)
+            try:
+                eng_tsla_same_hl._acquire_venue_locks()
+                raise AssertionError("expected shared HL signer lock contention")
+            except RuntimeError as e:
+                assert "already running" in str(e) and "hl-signer:" in str(e)
+
+            # 3) Different symbols with DEDICATED HL agent AND DEDICATED Lighter API key -> ALLOWED!
+            eng_tsla_dedicated = _make_pair("TSLA", "io:TSLA", 16, agent_b, lt_key_idx=3)
+            eng_tsla_dedicated._acquire_venue_locks()
+            eng_tsla_dedicated._release_venue_locks()
+        finally:
+            eng_nvda._release_venue_locks()
+
+        # 4) Single process --hedge tradexyz shares ONE HL signer across both legs -> NO self-deadlock!
+        eng_xyz = _make_pair("NVDA", "io:NVDA", -1, agent_a, lt_key_idx=2, hedge="tradexyz")
+        eng_xyz._acquire_venue_locks()
+        eng_xyz._release_venue_locks()
+    finally:
+        if orig_env is None:
+            os.environ.pop("ENTROPY_ARB_LOCK_DIR", None)
+        else:
+            os.environ["ENTROPY_ARB_LOCK_DIR"] = orig_env
+
+
+def test_review4_low_requirements_live_pins_lighter_sdk_commit_sha():
+    import re
+    req_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "requirements-live.txt")
+    with open(req_path, "r", encoding="utf-8") as fh:
+        lines = [ln.strip() for ln in fh if ln.strip() and not ln.strip().startswith("#")]
+    lighter_lines = [ln for ln in lines if "lighter-python" in ln or "lighter-sdk" in ln]
+    assert len(lighter_lines) == 1
+    assert re.search(r"lighter-python\.git@[0-9a-f]{40}$", lighter_lines[0]), (
+        f"lighter-sdk must be pinned to a full 40-char commit SHA, got: {lighter_lines[0]!r}"
+    )
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

@@ -92,6 +92,7 @@ class RiskConf:
     fee_check_interval_sec: float = 60.0
     reduce_only_ignore_session_buffer: bool = True
     max_book_age_sec: float = 0.0
+    max_reduce_book_age_sec: float = 15.0
     max_spread_bps: float = 0.0
     min_available_margin_usd: float = 0.0
     reconcile_drift_reduce_only: bool = True
@@ -274,6 +275,7 @@ _SCHEMA: Dict[str, Any] = {
         "fee_check_interval_sec": float,
         "reduce_only_ignore_session_buffer": bool,
         "max_book_age_sec": float,
+        "max_reduce_book_age_sec": float,
         "max_spread_bps": float,
         "min_available_margin_usd": float,
         "reconcile_drift_reduce_only": bool,
@@ -476,6 +478,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         reduce_only_ignore_session_buffer=bool(
             _get(raw, "risk", "reduce_only_ignore_session_buffer", True)),
         max_book_age_sec=float(_get(raw, "risk", "max_book_age_sec", 0.0)),
+        max_reduce_book_age_sec=float(_get(raw, "risk", "max_reduce_book_age_sec", 15.0)),
         max_spread_bps=float(_get(raw, "risk", "max_spread_bps", 0.0)),
         min_available_margin_usd=float(
             _get(raw, "risk", "min_available_margin_usd", 0.0)),
@@ -496,6 +499,8 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         raise ConfigError("risk.fee_check_interval_sec must be > 0")
     if risk_conf.max_book_age_sec < 0:
         raise ConfigError("risk.max_book_age_sec must be >= 0")
+    if risk_conf.max_reduce_book_age_sec <= 0:
+        raise ConfigError("risk.max_reduce_book_age_sec must be > 0")
     if risk_conf.max_spread_bps < 0:
         raise ConfigError("risk.max_spread_bps must be >= 0")
     if risk_conf.min_available_margin_usd < 0:

@@ -100,9 +100,9 @@ class InstanceLock:
                 fh.close()
                 scope = f" ({self.label})" if self.label else ""
                 raise RuntimeError(
-                    f"another live instance is already running for this market/account{scope} "
+                    f"another live instance is already running for this market/account/signer{scope} "
                     f"(lock: {self.lock_path}, holder={holder or 'unknown'}) / "
-                    f"检测到同品种或同账户市场实盘实例已在运行，禁止重复启动"
+                    f"检测到同品种、同账户或同签名密钥的实盘实例已在运行，禁止共享 nonce 或重复启动"
                 ) from e
         fh.seek(0)
         fh.truncate()
