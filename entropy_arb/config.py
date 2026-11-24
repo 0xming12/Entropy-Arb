@@ -204,6 +204,8 @@ class Config:
     require_entropy_update_on_persist: bool = False
     max_entry_book_age_sec: float = 0.0
     fill_fee_retry_delay_sec: float = 0.0
+    # Per-attempt execution timing/outcome journal (JSONL); "" disables it.
+    exec_journal: str = "logs/exec_attempts.jsonl"
     risk: RiskConf = field(default_factory=RiskConf)
     session_filter: SessionFilterConf = field(default_factory=SessionFilterConf)
     dynamic_midline: DynamicMidlineConf = field(default_factory=DynamicMidlineConf)
@@ -339,6 +341,7 @@ _SCHEMA: Dict[str, Any] = {
         "level": str,
         "status_interval_sec": float,
         "trades_csv": str,
+        "exec_journal": str,
         "dashboard": bool,
         "file": str,
     },
@@ -801,6 +804,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         log_level=str(_get(raw, "logging", "level", "INFO")).upper(),
         status_interval_sec=status_interval_sec,
         trades_csv=_get(raw, "logging", "trades_csv", "logs/trades.csv"),
+        exec_journal=str(_get(raw, "logging", "exec_journal", "logs/exec_attempts.jsonl") or ""),
         dashboard=bool(_get(raw, "logging", "dashboard", True)),
         log_file=_get(raw, "logging", "file", "logs/engine.log"),
         risk=risk_conf,

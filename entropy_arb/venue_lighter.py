@@ -424,6 +424,18 @@ class LighterVenue:
     async def send_taker(self, *, is_buy: bool, qty: float, limit_px: float,
                          reduce_only: bool = False,
                          client_order_id: Optional[str] = None) -> dict:
+        """Send an IOC market order; attaches monotonic ``timing`` marks to the result."""
+        timing: dict = {}
+        res = await self._send_taker(is_buy=is_buy, qty=qty, limit_px=limit_px,
+                                     reduce_only=reduce_only,
+                                     client_order_id=client_order_id, timing=timing)
+        if isinstance(res, dict):
+            res["timing"] = timing
+        return res
+
+    async def _send_taker(self, *, is_buy: bool, qty: float, limit_px: float,
+                          reduce_only: bool, client_order_id: Optional[str],
+                          timing: dict) -> dict:
         assert self.signer is not None
         from lighter import SignerClient
         coi_s = client_order_id or self.reserve_order_id()
@@ -438,6 +450,7 @@ class LighterVenue:
         fut = self.orders_feed.watch(coi) if self.orders_feed else None
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.settle_timeout
+        timing["submit_start_mono"] = time.monotonic()
         try:
             _tx, resp, err = await asyncio.wait_for(self.signer.create_order(
                 market_index=self.market_id,
@@ -450,6 +463,7 @@ class LighterVenue:
                 reduce_only=reduce_only,
                 order_expiry=SignerClient.DEFAULT_IOC_EXPIRY,
             ), timeout=max(0.0, deadline - loop.time()))
+            timing["submit_end_mono"] = time.monotonic()
         except asyncio.CancelledError:
             if fut is not None:
                 self.orders_feed.unwatch(coi)
@@ -510,6 +524,7 @@ class LighterVenue:
                     "client_order_id": coi_s}
         try:
             info = await asyncio.wait_for(fut, timeout=max(0.0, deadline - loop.time()))
+            timing["settle_mono"] = time.monotonic()
             fb = float(info["filled_base"])
             outcome = "filled" if fb > 0 else "canceled"
             return {"status": info["status"], "outcome": outcome,

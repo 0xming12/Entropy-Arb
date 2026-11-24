@@ -45,6 +45,7 @@ except ImportError:  # pragma: no cover - allows offline unit tests without aioh
 
 from .book import ArbPlan, floor_step, plan_arb, walk_depth
 from .config import Config
+from .exec_metrics import ExecJournal, ExecTrace, ExposureTracker
 from .notifier import TelegramNotifier
 from .recorder import MinuteRecorder
 from .risk import CircuitBreaker, SessionFilter, SessionState
@@ -94,7 +95,13 @@ class Engine:
                                                    "buy_entropy": None}
         self._last_eligible: Dict[str, float] = {}
         self._armed_entropy_mono: Dict[str, Optional[float]] = {}
+        # Seconds each direction's signal had persisted when it last passed the gate.
+        self._fire_persist_sec: Dict[str, float] = {}
         self._signal_reduce_only: Optional[bool] = None
+        # Execution timing/outcome journal and single-leg exposure tracking.
+        self.exec_journal = ExecJournal(None if record_only else cfg.exec_journal)
+        self.exposure = ExposureTracker(self.exec_journal)
+        self._exec_seq = 0
         self._step = 1e-4
         self._min_base = 0.0
         self._min_notional = 10.0
@@ -1298,8 +1305,17 @@ class Engine:
             self._last_eligible.pop(key, None)
             self._armed_entropy_mono.pop(key, None)
 
+    def _update_exposure(self) -> None:
+        """Open/close the single-leg exposure episode from the current ledger net."""
+        if not self.venues:
+            return
+        self.exposure.update(net=self._net_position(),
+                             tolerance=self.cfg.net_tolerance_base,
+                             can_close=not self.has_pending_reconcile())
+
     async def _evaluate(self) -> None:
         cfg = self.cfg
+        self._update_exposure()
         if self.halted or self.has_pending_reconcile():
             self._reset_signal()
             return
@@ -1326,6 +1342,12 @@ class Engine:
                     await self._maybe_hedge()
             return
         buy, sell, plan = best
+        decision = {
+            "selected_mono": time.monotonic(),
+            "selected_wall": time.time(),
+            "persist_sec": self._fire_persist_sec.get(
+                "sell_entropy" if sell.key == "entropy" else "buy_entropy"),
+        }
         reduce_only = self.is_reduce_only(now)
         lock_keys = sorted({buy.key, sell.key})
         acquired = []
@@ -1341,17 +1363,19 @@ class Engine:
         self._reset_signal()
         t = asyncio.create_task(
             self._execute_locked(buy, sell, plan, reduce_only=reduce_only,
-                                 acquired_locks=acquired))
+                                 acquired_locks=acquired, decision=decision))
         self._exec_tasks.add(t)
         t.add_done_callback(self._exec_tasks.discard)
         await asyncio.shield(t)
 
     async def _execute_locked(self, buy, sell, plan: ArbPlan,
                               reduce_only: bool = False,
-                              acquired_locks: Optional[list] = None) -> None:
+                              acquired_locks: Optional[list] = None,
+                              decision: Optional[dict] = None) -> None:
         unresolved = False
         try:
-            unresolved = await self._execute(buy, sell, plan, reduce_only=reduce_only)
+            unresolved = await self._execute(buy, sell, plan, reduce_only=reduce_only,
+                                             decision=decision)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1474,6 +1498,7 @@ class Engine:
                         and self.entropy.book.last_update_mono <= armed_e_mono):
                     self._schedule_poke(min(0.2, MAX_SIGNAL_GAP_SEC / 2))
                     continue
+            self._fire_persist_sec[dkey] = max(signal_time - armed, 0.0)
             if best is None or plan.exp_edge_usd > best[2].exp_edge_usd:
                 best = (buy, sell, plan)
         return best
@@ -1481,12 +1506,13 @@ class Engine:
     # ------------------------------------------------------------- execution
 
     async def _execute(self, buy, sell, plan: ArbPlan,
-                       reduce_only: bool = False) -> bool:
+                       reduce_only: bool = False,
+                       decision: Optional[dict] = None) -> bool:
         if self.stop.is_set() or self.halted or self.has_pending_reconcile():
             return False
         self._orders_in_flight += 1
         try:
-            return await self._execute_pair(buy, sell, plan, reduce_only)
+            return await self._execute_pair(buy, sell, plan, reduce_only, decision=decision)
         finally:
             self._orders_in_flight -= 1
             if self.has_pending_reconcile():
@@ -1689,9 +1715,71 @@ class Engine:
         self._reconcile_evt.set()
         self._update_evt.set()
 
-    async def _execute_pair(self, buy, sell, plan: ArbPlan, reduce_only: bool) -> bool:
+    def _new_exec_trace(self, buy, sell, plan: ArbPlan, *, direction: str,
+                        reduce_only: bool, decision: Optional[dict],
+                        exec_start: float) -> ExecTrace:
+        decision = decision or {}
+        selected_mono = float(decision.get("selected_mono", exec_start))
+        selected_wall = float(decision.get("selected_wall",
+                                           time.time() - (time.monotonic() - selected_mono)))
+        self._exec_seq += 1
+        trace = ExecTrace(
+            attempt_id=f"{int(selected_wall * 1000)}-{self._exec_seq}",
+            mode=self.cfg.execution_mode, direction=direction, reduce_only=reduce_only,
+            selected_mono=selected_mono, selected_wall=selected_wall,
+        )
+        trace.mark("exec_start", exec_start)
+        prepared = trace.mark("prepared")
+        ages = {}
+        for venue in (self.entropy, self.hedge):
+            age = venue.book.age_mono(prepared) if venue is not None else None
+            ages[f"{getattr(venue, 'key', 'venue')}_book_age_ms"] = (
+                None if age is None else round(age * 1000.0, 3))
+        persist = decision.get("persist_sec")
+        # Keep this cheap: it runs before the first order is sent. The midline
+        # (a rolling median when dynamic) is recorded after both legs return.
+        trace.set(
+            qty=plan.qty,
+            premium_bps=round(plan.marginal_premium_bps, 4),
+            persist_ms=None if persist is None else round(float(persist) * 1000.0, 3),
+            **ages,
+        )
+        return trace
+
+    def _finish_exec_trace(self, trace: ExecTrace, *, matched: float, unresolved: bool,
+                           imbalanced: bool, fill_edge: Optional[float]) -> None:
+        """Open an exposure episode if the attempt left net delta, then journal it."""
+        cfg = self.cfg
+        net_after = self._net_position()
+        exposure_open = abs(net_after) > cfg.net_tolerance_base
+        if exposure_open:
+            acks = trace.filled_ack_monos()
+            start = min(acks.values()) if acks else time.monotonic()
+            self.exposure.open(start_mono=start,
+                               start_wall=trace.selected_wall + (start - trace.t0),
+                               net=net_after, attempt_id=trace.attempt_id)
+        trace.set(matched=matched, unresolved=unresolved, imbalanced=imbalanced,
+                  exposure_open=exposure_open, net_after=net_after,
+                  midline_bps=round(self.current_midline_bps(), 4),
+                  fill_edge_usd=None if fill_edge is None else round(fill_edge, 6))
+        self.exec_journal.write(trace.to_record())
+        e_leg = trace.legs.get("entropy", {})
+        h_leg = trace.legs.get("hedge", {})
+        log.info("[EXEC] %s %s: entropy %s %.6g ack %sms | hedge %s %.6g ack %sms | "
+                 "leg gap %sms%s",
+                 trace.attempt_id, trace.direction,
+                 e_leg.get("status", "-"), e_leg.get("filled_base", 0.0),
+                 e_leg.get("ack_ms", "-"),
+                 h_leg.get("status", "-"), h_leg.get("filled_base", 0.0),
+                 h_leg.get("ack_ms", "-"),
+                 trace.to_record()["leg_gap_ms"],
+                 " | EXPOSURE OPEN" if exposure_open else "")
+
+    async def _execute_pair(self, buy, sell, plan: ArbPlan, reduce_only: bool, *,
+                            decision: Optional[dict] = None) -> bool:
         if self._bg_tasks:
             return False
+        exec_start = time.monotonic()
         cfg = self.cfg
         now = time.time()
         send_reduce_only = bool(reduce_only or self.is_reduce_only(now))
@@ -1728,6 +1816,9 @@ class Engine:
                  buy.name, qty, plan.buy_limit, sell.name,
                  plan.sell_limit, plan.buy_notional, plan.q_max_notional,
                  plan.marginal_premium_bps, plan.exp_edge_usd)
+        trace = self._new_exec_trace(buy, sell, plan, direction=direction,
+                                     reduce_only=send_reduce_only, decision=decision,
+                                     exec_start=exec_start)
 
         entropy_first = (
             cfg.execution_mode == "entropy_first"
@@ -1752,6 +1843,7 @@ class Engine:
             )
             if ids is None:
                 return False
+            trace.mark("staged")
             checked_at = time.monotonic()
             if not all(self._entry_book_fresh(venue, reduce_only=send_reduce_only,
                                               now_mono=checked_at)
@@ -1761,12 +1853,16 @@ class Engine:
                 log.warning("[PRE-SEND BLOCKED] %s %s/%s: book expired during order staging",
                             order_type, buy.name, sell.name)
                 return False
+            trace.mark("prechecked")
             self.last_trade_ts = now
             self._record_send(first_venue)
+            first_call = time.monotonic()
             first_info = await self._send_staged_order(
                 first_venue, ids, is_buy=first_is_buy, qty=qty, limit_px=first_bound,
                 reduce_only=send_reduce_only,
             )
+            trace.leg(first_venue, first_info, call_start=first_call,
+                      call_end=time.monotonic(), qty=qty, limit_px=first_bound)
             first_fill = float(first_info.get("filled_base") or 0.0)
             first_unresolved = bool(first_info.get("unresolved"))
             second_sent = False
@@ -1826,6 +1922,7 @@ class Engine:
                         ids, second_venue, is_buy=second_is_buy, qty=follow_qty,
                         limit_px=follow_bound, purpose="arb", reduce_only=send_reduce_only,
                     ):
+                        trace.mark("follow_staged")
                         log.info("[ARB-FOLLOW] %s%s: %s %s %.6g @%.6g (matched %s fill %.6g)",
                                  direction, " [RO]" if send_reduce_only else "",
                                  "BUY" if second_is_buy else "SELL",
@@ -1833,10 +1930,14 @@ class Engine:
                                  first_venue.name, first_fill)
                         self._record_send(second_venue)
                         second_sent = True
+                        second_call = time.monotonic()
                         second_info = await self._send_staged_order(
                             second_venue, ids, is_buy=second_is_buy, qty=follow_qty,
                             limit_px=follow_bound, reduce_only=send_reduce_only,
                         )
+                        trace.leg(second_venue, second_info, call_start=second_call,
+                                  call_end=time.monotonic(), qty=follow_qty,
+                                  limit_px=follow_bound)
                     else:
                         second_info = {
                             "status": "not-submitted", "outcome": "rejected",
@@ -1874,6 +1975,7 @@ class Engine:
             )
             if ids is None:
                 return False
+            trace.mark("staged")
             checked_at = time.monotonic()
             if not all(self._entry_book_fresh(venue, reduce_only=send_reduce_only,
                                               now_mono=checked_at)
@@ -1884,15 +1986,26 @@ class Engine:
                 log.warning("[PRE-SEND BLOCKED] %s %s/%s: book expired during order staging",
                             order_type, buy.name, sell.name)
                 return False
+            trace.mark("prechecked")
             self.last_trade_ts = now
             self._record_send(buy)
             self._record_send(sell)
-            binfo, sinfo = await asyncio.gather(
-                self._send_staged_order(buy, ids, is_buy=True, qty=qty, limit_px=buy_bound,
-                                        reduce_only=send_reduce_only),
-                self._send_staged_order(sell, ids, is_buy=False, qty=qty, limit_px=sell_bound,
-                                        reduce_only=send_reduce_only),
+
+            async def timed_send(venue, **kwargs):
+                started = time.monotonic()
+                info = await self._send_staged_order(venue, ids, **kwargs)
+                return info, started, time.monotonic()
+
+            (binfo, b_call, b_ack), (sinfo, s_call, s_ack) = await asyncio.gather(
+                timed_send(buy, is_buy=True, qty=qty, limit_px=buy_bound,
+                           reduce_only=send_reduce_only),
+                timed_send(sell, is_buy=False, qty=qty, limit_px=sell_bound,
+                           reduce_only=send_reduce_only),
             )
+            trace.leg(buy, binfo, call_start=b_call, call_end=b_ack, qty=qty,
+                      limit_px=buy_bound)
+            trace.leg(sell, sinfo, call_start=s_call, call_end=s_ack, qty=qty,
+                      limit_px=sell_bound)
 
         bfill = float(binfo.get("filled_base") or 0.0)
         sfill = float(sinfo.get("filled_base") or 0.0)
@@ -2111,6 +2224,12 @@ class Engine:
                            f"{binfo['status']}/{sinfo['status']}", paired_fill, matched_expected)
         self._log_csv(direction, buy, sell, plan, paired_fill, bfill, sfill,
                       binfo["status"], sinfo["status"], fill_edge, inv_bps)
+        try:
+            self._finish_exec_trace(trace, matched=matched, unresolved=unresolved,
+                                    imbalanced=imbalanced,
+                                    fill_edge=fill_edge if paired_fill else None)
+        except Exception:
+            log.exception("exec trace failed")
         self.last_trade_ts = time.time()
         committed = self._commit_orders(ids, ((buy, binfo), (sell, sinfo)))
         if committed and deferred_checks:
@@ -2136,6 +2255,7 @@ class Engine:
             "ok": ok})
 
     async def _maybe_hedge(self) -> None:
+        self._update_exposure()
         if self._state_fault or self.has_pending_reconcile():
             return
         net = self._net_position()
@@ -2143,6 +2263,7 @@ class Engine:
             self._reset_hedge_attempts()
             return
         await self._hedge(net)
+        self._update_exposure()
 
     def _pos_snapshot(self) -> Tuple[float, ...]:
         return tuple(round(float(v.position), 12) for v in self.venues.values())

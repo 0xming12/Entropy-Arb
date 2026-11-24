@@ -131,5 +131,6 @@ logging:
   level: INFO
   status_interval_sec: 30.0
   trades_csv: logs/trades.csv
+  exec_journal: logs/exec_attempts.jsonl   # per-attempt timing & outcome; "" disables / 每次发单的耗时与结果，留空关闭；用 tools/exec_report.py 汇总
   dashboard: true
   file: logs/engine.log

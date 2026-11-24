@@ -369,6 +369,18 @@ class HLVenue:
     async def send_taker(self, *, is_buy: bool, qty: float, limit_px: float,
                          reduce_only: bool = False,
                          client_order_id: Optional[str] = None) -> dict:
+        """Send an IOC limit order; attaches monotonic ``timing`` marks to the result."""
+        timing: dict = {}
+        res = await self._send_taker(is_buy=is_buy, qty=qty, limit_px=limit_px,
+                                     reduce_only=reduce_only,
+                                     client_order_id=client_order_id, timing=timing)
+        if isinstance(res, dict):
+            res["timing"] = timing
+        return res
+
+    async def _send_taker(self, *, is_buy: bool, qty: float, limit_px: float,
+                          reduce_only: bool, client_order_id: Optional[str],
+                          timing: dict) -> dict:
         from hyperliquid.utils.types import Cloid
         assert self.account is not None and self.asset_id >= 0
         s = self._signing
@@ -390,6 +402,7 @@ class HLVenue:
                                    expires_after=expires_after, is_mainnet=self.account.is_mainnet)
             payload = {"action": action, "nonce": nonce, "signature": sig,
                        "vaultAddress": None, "expiresAfter": expires_after}
+            timing["signed_mono"] = time.monotonic()
         except Exception as e:
             return {"status": "send-failed", "outcome": "rejected",
                     "filled_base": 0.0, "avg_px": None,
@@ -398,11 +411,13 @@ class HLVenue:
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.settle_timeout
+        timing["post_start_mono"] = time.monotonic()
         try:
             body, err, unresolved = await asyncio.wait_for(
                 self._post_exchange(payload), timeout=max(0.0, deadline - loop.time()))
         except asyncio.TimeoutError:
             body, err, unresolved = None, None, True
+        timing["post_end_mono"] = time.monotonic()
         if err is not None:
             return {"status": "send-failed", "outcome": "rejected",
                     "filled_base": 0.0, "avg_px": None,
