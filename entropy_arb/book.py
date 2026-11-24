@@ -49,6 +49,8 @@ class OrderBook:
         for name, side in (("bids", self.bids), ("asks", self.asks)):
             for lvl in ob.get(name) or []:
                 px, sz = float(lvl["price"]), float(lvl["size"])
+                if not (math.isfinite(px) and px > 0.0 and math.isfinite(sz)):
+                    continue
                 if sz <= 0:
                     side.pop(px, None)
                 else:
@@ -59,14 +61,23 @@ class OrderBook:
         self.touch()
 
     # ---- Hyperliquid full snapshot ----
-    def apply_hl(self, levels: list) -> None:
-        self.bids = {float(l["px"]): float(l["sz"])
-                     for l in levels[0] if float(l["sz"]) > 0}
-        self.asks = {float(l["px"]): float(l["sz"])
-                     for l in levels[1] if float(l["sz"]) > 0}
+    def apply_hl(self, levels: list, *, source_ts: Optional[float] = None) -> None:
+        self.bids = {
+            px: sz
+            for l in levels[0]
+            for px, sz in ((float(l["px"]), float(l["sz"])),)
+            if math.isfinite(px) and px > 0.0 and math.isfinite(sz) and sz > 0.0
+        }
+        self.asks = {
+            px: sz
+            for l in levels[1]
+            for px, sz in ((float(l["px"]), float(l["sz"])),)
+            if math.isfinite(px) and px > 0.0 and math.isfinite(sz) and sz > 0.0
+        }
         self.ready = True
-        self.last_update_ts = time.time()
-        self.last_update_mono = time.monotonic()
+        received = time.time()
+        self.last_update_ts = received if source_ts is None else min(received, source_ts)
+        self.last_update_mono = time.monotonic() - (received - self.last_update_ts)
         self.touch()
 
     def sorted_bids(self) -> List[Level]:

@@ -1,0 +1,23 @@
+[Unit]
+Description=Entropy arbitrage market data recorder (no trading)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=entropyarb
+Group=entropyarb
+WorkingDirectory=/opt/entropy-arb
+ExecStart=/opt/entropy-arb/.venv/bin/python main.py --record-only --symbol SNDK --hedge lighter --env-file /dev/null --no-dashboard
+Restart=on-failure
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/entropy-arb/logs
+
+[Install]
+WantedBy=multi-user.target

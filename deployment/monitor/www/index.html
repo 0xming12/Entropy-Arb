@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>NVDA 实盘监控</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="top-inner">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span> Entropy <span class="brand-divider">/</span> Lighter</div>
+      <div class="mode" id="mode" role="status"><i></i><span>连接中</span></div>
+    </div>
+  </header>
+  <main>
+    <section class="title">
+      <div><p class="ticker">NVDA 永续 <span>·</span> Lighter 主网</p><h1>实盘监控</h1></div>
+      <p class="update" id="updated" aria-live="polite">正在读取服务器数据</p>
+    </section>
+    <p class="notice" id="notice" hidden></p>
+    <section class="cards" aria-label="实盘数据概览">
+      <article class="panel card"><h2>已实现盈亏</h2><p class="value" id="daily">—</p><p class="hint">按美东交易日 · 机器人记账</p></article>
+      <article class="panel card"><h2>净仓位</h2><p class="value" id="net">—</p><p class="hint">两边合计 · NVDA</p></article>
+      <article class="panel card"><h2>本次运行盯市盈亏</h2><p class="value" id="mtm">—</p><p class="hint">包含持仓价格变动</p></article>
+      <article class="panel card"><h2>待对账订单</h2><p class="value" id="pending">—</p><p class="hint" id="risk-hint">等待实盘状态</p></article>
+    </section>
+    <section class="body-grid">
+      <article class="panel chart-panel">
+        <div class="panel-top">
+          <div><h2>双边溢价</h2><p class="hint">Entropy 相对 Lighter · 每分钟均值</p></div>
+          <div class="segmented" aria-label="图表时间范围">
+            <button type="button" data-hours="1" aria-pressed="false">1 小时</button>
+            <button type="button" data-hours="6" aria-pressed="true">6 小时</button>
+            <button type="button" data-hours="24" aria-pressed="false">24 小时</button>
+          </div>
+        </div>
+        <div class="chart-meta"><strong id="premium">—</strong><time id="quote-at"></time></div>
+        <div class="chart-wrap"><canvas id="chart" role="img" aria-label="双边溢价历史走势"></canvas><div id="chart-point" aria-hidden="true" hidden></div></div>
+        <div class="quote-layout">
+          <div><span>Entropy 买一 / 卖一</span><b id="entropy-quote">—</b></div>
+          <div><span>Lighter 买一 / 卖一</span><b id="lighter-quote">—</b></div>
+        </div>
+      </article>
+      <article class="panel side-panel">
+        <div class="panel-top"><div><h2>仓位与风控</h2><p class="hint" id="state-at">等待首次实盘状态</p></div></div>
+        <dl>
+          <div><dt>Entropy 仓位</dt><dd id="entropy-pos">—</dd></div>
+          <div><dt>Lighter 仓位</dt><dd id="hedge-pos">—</dd></div>
+          <div><dt>下单状态</dt><dd id="risk-state">—</dd></div>
+          <div><dt>连续亏损</dt><dd id="streak">—</dd></div>
+          <div><dt>已核实手续费</dt><dd id="actual">—</dd></div>
+          <div><dt>估算手续费</dt><dd id="estimate">—</dd></div>
+          <div><dt>已核实资金费</dt><dd id="funding">—</dd></div>
+        </dl>
+      </article>
+    </section>
+    <section class="panel trades">
+      <div class="panel-top"><div><h2>最近订单与成交</h2><p class="hint">来自实盘日志 · 时间为浏览器本地时区</p></div></div>
+      <p class="empty" id="trades-empty">实盘成交会在这里显示</p>
+      <div class="table-wrap" id="trade-wrap" hidden>
+        <table><thead><tr><th>时间</th><th>方向</th><th>计划数量</th><th>买腿成交</th><th>卖腿成交</th><th>成交价差收益</th></tr></thead><tbody id="trade-body"></tbody></table>
+      </div>
+    </section>
+    <section class="panel events" id="events-panel" hidden>
+      <div class="panel-top"><div><h2>风控与订单事件</h2><p class="hint">最近记录 · UTC</p></div></div>
+      <ul id="events"></ul>
+    </section>
+    <footer>只读监控 · 数据来自 VPS 上的机器人日志和状态文件</footer>
+  </main>
+</body>
+</html>

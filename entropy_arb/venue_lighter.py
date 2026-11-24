@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import time
 from collections import OrderedDict
 from typing import Callable, Optional
@@ -43,17 +44,20 @@ REST_TIMEOUT = 10.0
 
 _AMBIGUOUS_ERR_TOKENS = (
     "timeout", "timed out", "time out",
-    "500", "502", "503", "504", "408",
     "bad gateway", "service unavailable", "gateway",
     "temporarily unavailable", "internal server error",
     "connection", "disconnect", "reset by peer",
     "broken pipe", "eof", "server closed", "network",
 )
+_AMBIGUOUS_HTTP_CODE_RE = re.compile(
+    r"(?:http|status|code|error)[^\d]{0,8}\b(?:408|500|502|503|504)\b|\b(?:502|503|504)\b"
+)
 
 
 def _is_ambiguous_submit_error(msg: str) -> bool:
     low = msg.lower()
-    return any(tok in low for tok in _AMBIGUOUS_ERR_TOKENS)
+    return (any(tok in low for tok in _AMBIGUOUS_ERR_TOKENS)
+            or bool(_AMBIGUOUS_HTTP_CODE_RE.search(low)))
 
 
 def _terminal_order(status: str) -> bool:
@@ -424,9 +428,14 @@ class LighterVenue:
         from lighter import SignerClient
         coi_s = client_order_id or self.reserve_order_id()
         coi = int(coi_s)
-        fut = self.orders_feed.watch(coi) if self.orders_feed else None
         base_amount = int(round(qty * 10 ** self.size_decimals))
         price = int(round(limit_px * 10 ** self.price_decimals))
+        if base_amount <= 0 or price <= 0:
+            return {"status": "send-failed", "outcome": "rejected",
+                    "filled_base": 0.0, "avg_px": None,
+                    "err": f"non-positive order size/price ({base_amount}, {price})",
+                    "unresolved": False, "client_order_id": coi_s}
+        fut = self.orders_feed.watch(coi) if self.orders_feed else None
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.settle_timeout
         try:

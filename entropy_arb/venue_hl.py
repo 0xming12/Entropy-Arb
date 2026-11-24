@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import time
+from inspect import signature
 from typing import Callable, Optional
 from uuid import uuid4
 
@@ -147,7 +148,7 @@ class HLVenue:
             if a.get("isDelisted"):
                 raise RuntimeError(f"[{self.name}] {a['name']} is delisted")
             self.coin = a["name"]
-            self.asset_id = 110000 + (dex_index - 1) * 10000 + idx
+            self.asset_id = idx if dex_index == 0 else (110000 + (dex_index - 1) * 10000 + idx)
             self.size_decimals = int(a["szDecimals"])
             self.min_base = 10 ** -self.size_decimals
             if a.get("deployerFeeScale") is not None:
@@ -172,6 +173,15 @@ class HLVenue:
                 "live trading on Hyperliquid needs the official SDK — "
                 "pip install -r requirements-live.txt "
                 "(hyperliquid-python-sdk)") from e
+        try:
+            signature(hl_signing.sign_l1_action).bind(
+                None, None, None, 0, expires_after=None, is_mainnet=True)
+        except (AttributeError, TypeError, ValueError) as e:
+            raise RuntimeError(
+                f"[{self.name}] incompatible Hyperliquid signing SDK; "
+                "requires hyperliquid-python-sdk>=0.12.0 with expires_after support. "
+                "Run pip install -r requirements-live.txt before starting live trading."
+            ) from e
         self._signing = hl_signing
         self.account = HLAccount(c.private_key, c.account_address, self.api_url)
         log.info("[%s] %s", self.name, self.account.describe())
@@ -213,17 +223,20 @@ class HLVenue:
                 raise RuntimeError(
                     f"[{self.name}] failed to verify extraAgents for {query_addr}: {e!r}"
                 ) from e
-            if isinstance(agents, list):
-                now_ms = int(time.time() * 1000)
-                for ag in agents:
-                    if str((ag or {}).get("address", "")).lower() == signer_addr:
-                        valid_until = ag.get("validUntil")
-                        if valid_until is not None and int(valid_until) <= now_ms:
-                            raise RuntimeError(
-                                f"[{self.name}] agent wallet {signer_addr} authorization expired "
-                                f"(validUntil={valid_until})"
-                            )
-                        break
+            if not isinstance(agents, list):
+                raise RuntimeError(
+                    f"[{self.name}] unexpected Hyperliquid extraAgents response: {agents!r}"
+                )
+            now_ms = int(time.time() * 1000)
+            for ag in agents:
+                if str((ag or {}).get("address", "")).lower() == signer_addr:
+                    valid_until = ag.get("validUntil")
+                    if valid_until is not None and int(valid_until) <= now_ms:
+                        raise RuntimeError(
+                            f"[{self.name}] agent wallet {signer_addr} authorization expired "
+                            f"(validUntil={valid_until})"
+                        )
+                    break
             log.info("[%s] verified agent %s -> main account %s",
                      self.name, signer_addr, query_addr)
             return
@@ -369,10 +382,14 @@ class HLVenue:
             wire = s.order_request_to_order_wire(order_req, self.asset_id)
             action = s.order_wires_to_order_action([wire])
             nonce = self.account.nonces.next()
+            expires_after = (
+                int(time.time() * 1000)
+                + max(int(self.settle_timeout * 1000) + 5_000, 15_000)
+            )
             sig = s.sign_l1_action(self.account.wallet, action, None, nonce,
-                                   None, self.account.is_mainnet)
+                                   expires_after=expires_after, is_mainnet=self.account.is_mainnet)
             payload = {"action": action, "nonce": nonce, "signature": sig,
-                       "vaultAddress": None, "expiresAfter": None}
+                       "vaultAddress": None, "expiresAfter": expires_after}
         except Exception as e:
             return {"status": "send-failed", "outcome": "rejected",
                     "filled_base": 0.0, "avg_px": None,
@@ -621,6 +638,7 @@ class HLVenue:
         if addr is None:
             return None
         unified_free = await self._fetch_unified_free_margin(addr)
+        is_unified = self._user_abstraction in ("unifiedAccount", "portfolioMargin")
         if self.include_core_equity:
             try:
                 p = await self._info({"type": "portfolio", "user": addr})
@@ -629,7 +647,7 @@ class HLVenue:
                         hist = d.get("accountValueHistory") or []
                         if hist:
                             free_val = unified_free
-                            if free_val is None:
+                            if free_val is None and not is_unified:
                                 try:
                                     st = await self._info(
                                         {"type": "clearinghouseState", "user": addr,
@@ -643,14 +661,17 @@ class HLVenue:
                 log.debug("[%s] portfolio fetch failed, falling back: %r",
                           self.name, e)
         dexs = [self.conf.hl_dex] + ([""] if self.include_core_equity else [])
-        eq = fr = 0.0
+        eq = 0.0
+        fr: Optional[float] = None
         for dex in dexs:
             st = await self._info({"type": "clearinghouseState", "user": addr,
                                    "dex": dex})
             ms = st.get("marginSummary") or {}
             eq += float(ms.get("accountValue") or 0.0)
-            fr += float(st.get("withdrawable") or 0.0)
-        return eq, (unified_free if unified_free is not None else fr)
+            if dex == self.conf.hl_dex and st.get("withdrawable") is not None:
+                fr = float(st["withdrawable"])
+        free_out = unified_free if is_unified else fr
+        return eq, free_out
 
     async def fetch_position(self) -> float:
         addr = self._query_address()
@@ -715,6 +736,21 @@ class HLVenue:
             raw_dfs = asset.get("deployerFeeScale")
             if raw_dfs is None:
                 raw_dfs = meta.get("deployerFeeScale")
+            if raw_dfs is None:
+                dexs = await self._info({"type": "perpDexs"})
+                if not isinstance(dexs, list):
+                    return None
+                dex_info = next(
+                    (d for d in dexs if isinstance(d, dict) and d.get("name") == self.conf.hl_dex),
+                    None,
+                )
+                if dex_info is None:
+                    log.warning("[%s] dex %s not found in perpDexs; fee unknown",
+                                self.name, self.conf.hl_dex)
+                    return None
+                raw_dfs = dex_info.get("deployerFeeScale")
+                if raw_dfs is not None:
+                    self.deployer_fee_scale = float(raw_dfs)
             if raw_dfs is None:
                 raw_dfs = self.deployer_fee_scale
             dfs = 1.0 if raw_dfs is None else float(raw_dfs)

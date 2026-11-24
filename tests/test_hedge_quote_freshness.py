@@ -17,6 +17,7 @@ sizing:
 risk:
   max_book_age_sec: 2
   max_reduce_book_age_sec: 10
+  max_rebalance_exposure_usd: 30
 """ + persistence, hedge="lighter")
     engine._step = 0.001
     engine._min_base = 0.025

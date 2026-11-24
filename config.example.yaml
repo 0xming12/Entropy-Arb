@@ -68,6 +68,7 @@ risk:
   reduce_only_ignore_session_buffer: true  # reduce_only 模式下减仓方向豁免休市缓冲，防止卡死平仓
   max_book_age_sec: 30.0               # 开仓盘口有效更新的最久等待时间（秒）；0 = 关闭此开仓限制
   max_reduce_book_age_sec: 15.0        # 减仓、单腿补单和再平衡的盘口更新时间上限（秒，必须大于 0）
+  max_rebalance_exposure_usd: 0.0     # 双腿非对称再平衡允许的最坏净敞口估值（美元），0 表示关闭
   max_spread_bps: 150.0                # 极端价差绝对值上限（bps），防范单所插针或预言机脱锚；0 = 关闭
   min_available_margin_usd: 100.0      # 单所可用保证金下限（美元，查询失败时亦暂停新增风险）；0 = 关闭
   reconcile_drift_reduce_only: true    # 定时对账发现本地与链上仓位偏差超过容差时自动切 reduce_only 并告警

@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from entropy_arb.state import StateStore  # noqa: E402
+from entropy_arb.state import InstanceLock, StateStore  # noqa: E402
 
 
 def inspect_state(path: Path) -> dict:
@@ -64,53 +64,72 @@ def apply_supervised_recovery(
         state = json.load(stream)
     if not isinstance(state, dict):
         raise ValueError("expected a state JSON object")
-    pending = state.setdefault("pending_orders", {})
-    ledger = state.setdefault("venue_ledger", {})
-    if not isinstance(pending, dict) or not isinstance(ledger, dict):
-        raise ValueError("invalid order journal or position ledger")
+    lock: InstanceLock | None = None
+    sym, hv = state.get("symbol"), state.get("hedge_venue")
+    if isinstance(sym, str) and sym and isinstance(hv, str) and hv:
+        safe_pair = f"{sym}_{hv}".replace("/", "_")
+        lock = InstanceLock(str(path.parent / f"{safe_pair}.lock"), label=safe_pair)
+        lock.acquire()
+    try:
+        # Re-read under lock so edits apply to the latest durable snapshot.
+        with path.open(encoding="utf-8") as stream:
+            state = json.load(stream)
+        if not isinstance(state, dict):
+            raise ValueError("expected a state JSON object")
+        pending = state.setdefault("pending_orders", {})
+        ledger = state.setdefault("venue_ledger", {})
+        if not isinstance(pending, dict) or not isinstance(ledger, dict):
+            raise ValueError("invalid order journal or position ledger")
 
-    removed = []
-    for key in resolve_zero_fill or []:
-        if key not in pending:
-            raise ValueError(f"pending order key not found: {key!r}")
-        entry = pending[key]
-        if float(entry.get("known_filled") or 0.0) != 0.0:
-            raise ValueError(
-                f"refusing zero-fill clear for {key!r} with known_filled={entry.get('known_filled')}"
-            )
-        pending.pop(key)
-        removed.append(key)
+        removed = []
+        for key in resolve_zero_fill or []:
+            if key not in pending:
+                raise ValueError(f"pending order key not found: {key!r}")
+            entry = pending[key]
+            if float(entry.get("known_filled") or 0.0) != 0.0:
+                raise ValueError(
+                    f"refusing zero-fill clear for {key!r} with known_filled={entry.get('known_filled')}"
+                )
+            pending.pop(key)
+            removed.append(key)
 
-    updated_positions = {}
-    for spec in set_positions or []:
-        if "=" not in spec:
-            raise ValueError(f"expected venue=qty, got {spec!r}")
-        vkey, raw_qty = spec.split("=", 1)
-        vkey = vkey.strip()
-        if vkey not in ledger or not isinstance(ledger[vkey], dict):
-            raise ValueError(f"venue {vkey!r} not in saved venue_ledger ({sorted(ledger)})")
-        qty = float(raw_qty)
-        if not math.isfinite(qty):
-            raise ValueError(f"position for {vkey!r} must be finite")
-        ledger[vkey]["position"] = qty
-        updated_positions[vkey] = qty
+        updated_positions = {}
+        for spec in set_positions or []:
+            if "=" not in spec:
+                raise ValueError(f"expected venue=qty, got {spec!r}")
+            vkey, raw_qty = spec.split("=", 1)
+            vkey = vkey.strip()
+            if vkey not in ledger or not isinstance(ledger[vkey], dict):
+                raise ValueError(f"venue {vkey!r} not in saved venue_ledger ({sorted(ledger)})")
+            qty = float(raw_qty)
+            if not math.isfinite(qty):
+                raise ValueError(f"position for {vkey!r} must be finite")
+            ledger[vkey]["position"] = qty
+            updated_positions[vkey] = qty
 
-    if clear_reconcile or (removed and not pending):
-        if pending:
-            raise ValueError("cannot clear reconcile_required while pending_orders is non-empty")
-        state["reconcile_required"] = False
+        if updated_positions:
+            # Position was overridden without matching cashflow; force a clean MTM re-baseline on restart.
+            state["daily_mtm_baseline"] = None
 
-    backup = Path(f"{path}.bak.{int(time.time())}")
-    shutil.copy2(path, backup)
-    store = StateStore(str(path))
-    if not store.save(state):
-        raise OSError(f"atomic save failed for {path}; backup preserved at {backup}")
-    return {
-        "backup": str(backup),
-        "removed_pending": removed,
-        "updated_positions": updated_positions,
-        "state": inspect_state(path),
-    }
+        if clear_reconcile or (removed and not pending):
+            if pending:
+                raise ValueError("cannot clear reconcile_required while pending_orders is non-empty")
+            state["reconcile_required"] = False
+
+        backup = Path(f"{path}.bak.{int(time.time())}")
+        shutil.copy2(path, backup)
+        store = StateStore(str(path))
+        if not store.save(state):
+            raise OSError(f"atomic save failed for {path}; backup preserved at {backup}")
+        return {
+            "backup": str(backup),
+            "removed_pending": removed,
+            "updated_positions": updated_positions,
+            "state": inspect_state(path),
+        }
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 def main() -> None:

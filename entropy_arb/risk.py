@@ -394,9 +394,10 @@ class CircuitBreaker:
                 f"available margin below ${self.min_available_margin_usd:.2f}: "
                 + ", ".join(low)
             )
+            was_tripped = self.margin_tripped
             self.margin_tripped = True
             self.margin_reason = reason
-            return (not was_blocked), False, reason
+            return (not was_tripped), False, reason
         if self.margin_unknown_venues:
             reason = (
                 f"available margin unknown on {', '.join(sorted(self.margin_unknown_venues))} "
@@ -437,8 +438,12 @@ class CircuitBreaker:
         if data.get("day_key") != today:
             self.daily_realized_pnl_usd = 0.0
             self.consecutive_losses = 0
-            self.loss_tripped = False
-            self.loss_reason = ""
+            if self.breaker_action == "halt" and bool(data.get("loss_tripped", False)):
+                self.loss_tripped = True
+                self.loss_reason = str(data.get("loss_reason") or "prior halt requires manual clear")
+            else:
+                self.loss_tripped = False
+                self.loss_reason = ""
             return False
         self.daily_realized_pnl_usd = float(data.get("daily_realized_pnl_usd") or 0.0)
         self.consecutive_losses = int(data.get("consecutive_losses") or 0)

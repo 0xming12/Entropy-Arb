@@ -31,19 +31,20 @@
    - 启动期 `HLVenue.verify_account()` 调用 Hyperliquid `userRole` 与 `extraAgents` 校验签名私钥确实是该 `HL_ACCOUNT_ADDRESS` 的未过期授权 Agent（或主钱包本人），否则拒绝启动，彻底杜绝查空 Agent 账户误平对冲腿的风险。
 2. **小额残余 / 亚步长敞口全覆盖平仓（Medium）**：
    - 独立碎单全平：`_hedge_attempts()` 当单腿 `reduce_only` 补单可一次性全平该交易所残余仓位时，豁免 `min_order_notional`/`min_quote`。
-   - 叠加在匹配仓位上的小额 / 亚 `_step` 残余：新增 `_try_rebalance_submin_hedge()`，通过**双腿非对称 `reduce_only` 再平衡**（超额腿多减、对侧腿按最小合规额减仓，双腿均严格满足 `min_quote <= notional <= max_order_notional`，大残余自动分片；当超额腿步长更粗、对侧腿步长更细时，以粗步长腿对齐网格并由细步长腿吸收细微残差）直接清零残余净敞口，不再长期锁死在 `REDUCE-ONLY`。
+   - 叠加在匹配仓位上的小额残余可通过双腿非对称 `reduce_only` 再平衡处理。默认关闭（`risk.max_rebalance_exposure_usd: 0`）。启用后，按两腿盘口和限价中的最高价计算单腿独自成交时的最坏净敞口，超过预算则跳过。无法通过常规单腿补单处理的残余需要人工处理。
 3. **全局固定目录的账户+品种及签名密钥独占锁（Medium/Low）**：
    - 实盘启动后在固定绝对路径 `~/.entropy-arb/locks`（可通过 `ENTROPY_ARB_LOCK_DIR` 覆盖）同时对每个交易所的 `state_identity()`（`venue_<hash>.lock`）与 `signer_identity()`（`signer_<hash>.lock`：HL 签名地址、Lighter `api_url/account_index/api_key_index`）加独占文件锁，完全独立于各配置文件的 `state_dir` 与工作目录 `CWD`。
    - 既防止同账户同品种多实例冲突，也阻止不同品种的两个实盘进程共享同一签名私钥的 nonce 流导致互相作废订单（单进程内 `--hedge tradexyz` 双腿共享同一 HL 签名器自动去重不自锁；多品种并发需为每个进程分配独立 HL Agent 与 Lighter `API_KEY_INDEX`）。
 4. **动态中枢下的库存成本基准闭环归因与同步夹紧（Low）**：
    - 新增 `_attribute_pair_pnl()` 并在 `state.json` 中持久化 `inv_basis`（开仓净量、加权平均现金价差与已入账基准）；平仓时严格按真实闭环现金盈亏 `avg_entry_cash + close_cash` 计算 `daily_realized_pnl_usd` 与 `max_consecutive_losses`，消除 `dynamic_midline` 漂移导致的假盈利/漏计连亏问题。
    - 新增 `_sync_inv_basis_to_positions()` 在同步成交、单腿补单、非对称再平衡、链上仓位漂移采纳与重启加载时实时将成本基准夹紧到真实匹配持仓（空仓时清零），并将超时后在对账阶段延迟结案的套利腿统一送入同一闭环归因通道，防止成本基准漂移导致重复记亏或误清连亏计数。
+   - 延后核实到的实际手续费会修正现金账、匹配库存成本、当日已实现盈亏与连亏计数，并立即写入状态文件。紧急单腿补单无需等待；查询未能核实的手续费和成交时写入的 CSV 仍使用估算值。
 4. **未决 `not-found` IOC 过期自愈 + 人工备份式恢复工具（Low）**：
    - 新增 `execution.pending_not_found_expire_sec`（默认 `120.0` 秒，`0` = 关闭）：对连续 3 次返回 `unknownOid`/`not-found` 且超过过期窗口的 `known_filled=0` 未决 IOC，在**双边链上持仓严格吻合零成交预期**的前提下安全按零成交结案；若链上仓位不符则继续保持暂停。
    - 升级 `tools/inspect_order_state.py`，新增 `--resolve-zero-fill`、`--set-position`、`--clear-reconcile`（必须带 `--confirm`，修改前自动生成 `.bak.<ts>` 备份并原子写入）。
 5. **配置数值范围全量校验（Low）**：补齐 `status_interval_sec > 0`、`reconcile_sec > 0`、`staleness_sec > 0`、`venue_probe_sec > 0`、`max_orders_per_min >= 1`、`max_consecutive_errors >= 1`、`net_tolerance_base >= 0`、`inventory.floor_frac ∈ [0, 1)`、`taker_fee_bps >= 0`、`pending_not_found_expire_sec >= 0` 等边界校验。
 6. **释放 `latency_buffer_bps` 作为边界滑点空间**：正常入场的 `_worst_case_check()` / `_order_price_bounds()` 扣除 `latency_buffer_bps`，信号刚过门槛时两腿不再被压成 `0 bps` 贴盘口限价单。
-7. **开仓和减仓分别检查盘口更新时间**。`max_book_age_sec` 用于开仓。`max_reduce_book_age_sec` 用于配对减仓、单腿补单和双腿再平衡，默认 15 秒，必须为正数。两种模式都检查连接状态。有心跳但盘口已过期时，程序会阻止委托并尝试重新订阅，取得新盘口后继续评估。若长时间拿不到新数据，残仓仍需要人工处理。
+7. **开仓和减仓分别检查盘口更新时间**。`max_book_age_sec` 用于开仓。`max_reduce_book_age_sec` 用于配对减仓、单腿补单和双腿再平衡，默认 15 秒，必须为正数。两种模式都检查连接状态。 Entropy/Hyperliquid 盘口按交易所时间戳计算年龄，并丢弃过老、明显超前及乱序帧。有心跳但盘口已过期时，程序会阻止委托并尝试重新订阅，取得新盘口后继续评估。若长时间拿不到新数据，残仓仍需要人工处理。
 8. **单腿补单优先级与分片计数优化**：`_evaluate()` 存在超容差裸敞口时优先执行 `_maybe_hedge()`（不受 `cooldown_sec` 阻挡）；`_hedge_attempt_count` 仅累计失败/零成交重试次数，大额敞口分多片正常成交不会误触停机。
 9. **Lighter 模糊错误分类与 SDK 兼容**：`create_order` 返回 `502/503/504/timeout/connection` 类错误字符串时一律判为 `unresolved: True` 进入 P0-1 对账；超时取消后尝试通知 `nonce_manager`；`query_order` 遇到 `AttributeError`/`TypeError` 自动降级到 `account_inactive_orders`。
 10. **HL Unified Account 可用保证金兼容 & 其他加固**：

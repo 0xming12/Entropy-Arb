@@ -76,7 +76,7 @@ sizing:
             # This is the only fresh book notification after reconnect. The
             # strategy receives it while the original retry delay is active.
             feed._on_frame({"channel": "l2Book", "data": {
-                "coin": "io:NVDA",
+                "coin": "io:NVDA", "time": int(time.time() * 1000),
                 "levels": [[{"px": "144.00", "sz": "20"}],
                            [{"px": "144.02", "sz": "20"}]],
             }})

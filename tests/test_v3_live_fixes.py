@@ -770,6 +770,7 @@ execution:
   hedge_retry_delay_sec: 0.0
   hedge_max_retries: 3
 """, hedge="lighter")
+    eng.cfg.risk.max_rebalance_exposure_usd = 30
     eng._step, eng._min_base = 0.001, 0.025
     eng.entropy.size_decimals = eng.hedge.size_decimals = 3
     eng.entropy.set_book(143.98, 144.00)
@@ -792,6 +793,7 @@ execution:
   net_tolerance_base: 0.0001
   hedge_retry_delay_sec: 0.0
 """, hedge="lighter")
+    eng2.cfg.risk.max_rebalance_exposure_usd = 30
     eng2._step, eng2._min_base = 0.001, 0.001
     eng2.entropy.size_decimals = 4
     eng2.hedge.size_decimals = 3
@@ -999,6 +1001,7 @@ execution:
   hedge_retry_delay_sec: 0.0
   hedge_max_retries: 3
 """, hedge="lighter")
+    eng.cfg.risk.max_rebalance_exposure_usd = 30
     eng._step, eng._min_base = 0.01, 0.01
     eng.entropy.size_decimals = 2
     eng.hedge.size_decimals = 3
@@ -1026,6 +1029,7 @@ execution:
   hedge_retry_delay_sec: 0.0
   hedge_max_retries: 3
 """, hedge="lighter")
+    eng2.cfg.risk.max_rebalance_exposure_usd = 30
     eng2._step, eng2._min_base = 0.01, 0.01
     eng2.entropy.size_decimals = 2
     eng2.hedge.size_decimals = 3
@@ -1050,6 +1054,7 @@ execution:
   net_tolerance_base: 0.0005
   hedge_retry_delay_sec: 0.0
 """, hedge="lighter")
+    eng3.cfg.risk.max_rebalance_exposure_usd = 30
     eng3._step, eng3._min_base = 0.01, 0.01
     eng3.entropy.size_decimals = 2
     eng3.hedge.size_decimals = 3
@@ -1074,6 +1079,7 @@ execution:
 risk:
   max_consecutive_losses: 3
 """, hedge="lighter", midline=0.0, upper=2.0, lower=2.0, leg_slip=2.0)
+    eng.cfg.risk.max_rebalance_exposure_usd = 30
     eng._step, eng._min_base = 0.001, 0.001
     eng.entropy.size_decimals = eng.hedge.size_decimals = 3
     eng.entropy.set_book(144.06, 144.08)
@@ -1146,6 +1152,7 @@ risk:
     assert eng_b.circuit_breaker.consecutive_losses == 0
 
     # Now exit at a real -$0.03 round-trip loss (buy Entropy 100.08, sell Hedge 100.00)
+    eng_b.cfg.reduce_only_exit_threshold_bps = -10.0
     eng_b.entropy.set_book(100.07, 100.08)
     eng_b.hedge.set_book(100.00, 100.01)
     p_out = ArbPlan(1.0, 100.08, 100.00, 100.08, 100.00, 10.0, 1000.0, -8.0, -8.0, 0.0, 0.0)
@@ -1177,6 +1184,7 @@ persistence:
     asyncio.run(eng_c._execute(eng_c.hedge, eng_c.entropy, p_in))
     approx(eng_c._inv_signed_qty, -1.0, tol=1e-9)
 
+    eng_c.cfg.reduce_only_exit_threshold_bps = -10.0
     eng_c.entropy.set_book(100.07, 100.08)
     eng_c.hedge.set_book(100.00, 100.01)
     eng_c.entropy.send_responses = [{"status": "filled", "outcome": "filled", "filled_base": 1.0,

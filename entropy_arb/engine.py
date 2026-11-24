@@ -93,6 +93,7 @@ class Engine:
         self._armed: Dict[str, Optional[float]] = {"sell_entropy": None,
                                                    "buy_entropy": None}
         self._last_eligible: Dict[str, float] = {}
+        self._armed_entropy_mono: Dict[str, Optional[float]] = {}
         self._signal_reduce_only: Optional[bool] = None
         self._step = 1e-4
         self._min_base = 0.0
@@ -353,6 +354,41 @@ class Engine:
             return None
         return ids
 
+    def _stage_followup_order(
+        self, ids: Dict[str, str], venue, *, is_buy: bool, qty: float,
+        limit_px: float, purpose: str, reduce_only: bool,
+    ) -> bool:
+        """Persist a sequential follow-up leg alongside the already-staged primary leg."""
+        if not hasattr(venue, "reserve_order_id"):
+            return True
+        cid = venue.reserve_order_id()
+        okey = f"{venue.key}:{cid}"
+        ids[venue.key] = cid
+        self._pending_orders[okey] = {
+            "venue_key": venue.key,
+            "client_order_id": cid,
+            "is_buy": is_buy,
+            "qty": float(qty),
+            "limit_px": limit_px,
+            "known_filled": 0.0,
+            "purpose": purpose,
+            "reduce_only": reduce_only,
+            "submission": "attempted",
+            "created_ts": time.time(),
+        }
+        if purpose == "arb" and len(ids) == 2:
+            stage_pair_id = ":".join(sorted(f"{k}:{v}" for k, v in ids.items()))
+            for k, v in ids.items():
+                rec = self._pending_orders.get(f"{k}:{v}")
+                if rec is not None:
+                    rec["pair_id"] = stage_pair_id
+        if not self.save_state():
+            self._pending_orders.pop(okey, None)
+            ids.pop(venue.key, None)
+            self._stop_on_state_error("could not persist follow-up order before submission")
+            return False
+        return True
+
     def _stop_on_state_error(self, reason: str) -> None:
         self._state_fault = True
         self.halted = True
@@ -467,7 +503,7 @@ class Engine:
         today = self.circuit_breaker.day_for(now)
         cb_ok = self.circuit_breaker.load_state(data.get("circuit_breaker"), now=now)
         dm_n = self.dynamic_midline.load_state(data.get("dynamic_midline"), now=now)
-        if cb_ok and self.circuit_breaker.should_halt:
+        if self.circuit_breaker.should_halt:
             self.halted = True
 
         if (ledger_complete and data.get("daily_mtm_day") == today
@@ -656,12 +692,12 @@ class Engine:
         self._min_notional = max(cfg.min_order_notional,
                                  self.entropy.min_quote, self.hedge.min_quote)
         log.info("pair ENTROPY(%s)-%s(%s): midline=%+.2fbps band=[-%.2f, +%.2f] "
-                 "lat_buf=%.2fbps fees=%.2f+%.2f step=%g min_ntl=$%g",
+                 "lat_buf=%.2fbps fees=%.2f+%.2f mode=%s step=%g min_ntl=$%g",
                  self.entropy.conf.symbol, self.hedge.name,
                  self.hedge.conf.symbol, cfg.midline_bps, cfg.lower_bps,
                  cfg.upper_bps, cfg.latency_buffer_bps,
                  self.entropy.fee_bps, self.hedge.fee_bps,
-                 self._step, self._min_notional)
+                 cfg.execution_mode, self._step, self._min_notional)
 
         if self.record_only:
             log.warning("RECORD-ONLY — collecting minute data, no strategy, "
@@ -875,28 +911,35 @@ class Engine:
         session_buffer & adverse funding_skew) so entering reduce_only (off-hours,
         transient fee/margin query failure, startup, or breaker) does NOT
         panic-liquidate a delta-neutral pair at -50 bps.
+        When reduce_only_exit_threshold_bps is set, it is applied relative to
+        the current midline_bps so non-zero midlines remain symmetric.
         """
         if not reduce_only or self.cfg.reduce_only_exit_threshold_bps is None:
             return self._eff_threshold(buy, sell, now=now, include_latency_buffer=True)
-        threshold = self.cfg.reduce_only_exit_threshold_bps
+        mid = self.current_midline_bps()
+        sell_entropy = (sell.key == "entropy")
+        edge = self.cfg.reduce_only_exit_threshold_bps
         if not self.cfg.risk.reduce_only_ignore_session_buffer:
-            threshold += self.session_state(now).spread_buffer_bps
-        return threshold
+            edge += self.session_state(now).spread_buffer_bps
+        return (mid + edge) if sell_entropy else (edge - mid)
 
     def _required_spread_bps(self, buy, sell, *, reduce_only: bool,
                              now: Optional[float] = None) -> float:
         """Post-slippage worst-case floor for _order_price_bounds & _worst_case_check.
 
-        Excludes latency_buffer_bps on normal entries so the latency buffer
-        provides actual slippage room at the entry boundary rather than squeezing
-        limit slippage to 0 bps.
+        Excludes latency_buffer_bps on normal entries and default mean-reversion
+        exits so the latency buffer provides actual slippage room without
+        widening limit slippage to reduce_only_min_worst_bps unless active
+        bounded-loss reduce_only exits are explicitly enabled.
         """
-        if not reduce_only:
+        if not reduce_only or self.cfg.reduce_only_exit_threshold_bps is None:
             return self._eff_threshold(buy, sell, now=now, include_latency_buffer=False)
-        threshold = self.cfg.reduce_only_min_worst_bps
+        mid = self.current_midline_bps()
+        sell_entropy = (sell.key == "entropy")
+        edge = self.cfg.reduce_only_min_worst_bps
         if not self.cfg.risk.reduce_only_ignore_session_buffer:
-            threshold += self.session_state(now).spread_buffer_bps
-        return threshold
+            edge += self.session_state(now).spread_buffer_bps
+        return (mid + edge) if sell_entropy else (edge - mid)
 
     def _plan(self, buy, sell, cap_notional: float,
               now: Optional[float] = None, *, reduce_only: bool = False,
@@ -946,25 +989,77 @@ class Engine:
         self, buy, sell, plan: ArbPlan, qty: float, *,
         reduce_only: bool = False, now: Optional[float] = None,
     ) -> Optional[Tuple[float, float]]:
-        """Round limits inward while spending only the spread above the required bps."""
+        """Round limits inward while spending only the spread above the required bps.
+
+        When execution.hedge_leg_slippage_bps is configured, caps the hedge leg's
+        slippage budget at that tighter limit and allocates the remaining spread
+        headroom (up to leg_slippage_bps) to the slower Entropy leg so coarse
+        tick rounding and Hyperliquid latency do not starve Entropy fills.
+        """
         slip = self.cfg.leg_slippage_bps / 1e4
         if not 0.0 <= slip < 1.0:
             return None
-        if self.cfg.check_worst_case_spread:
-            net_buy = plan.buy_limit * (1.0 + self.effective_fee_bps(buy) / 1e4)
-            net_sell = plan.sell_limit * (1.0 - self.effective_fee_bps(sell) / 1e4)
-            required = 1.0 + self._required_spread_bps(
-                buy, sell, reduce_only=reduce_only, now=now) / 1e4
-            if not (math.isfinite(net_buy) and math.isfinite(net_sell)
-                    and math.isfinite(required) and min(net_buy, net_sell, required) > 0.0):
-                return None
-            # For slippage s on each leg, require
-            # net_sell * (1-s) >= required * net_buy * (1+s).
-            required_value = required * net_buy
-            available = (net_sell - required_value) / (net_sell + required_value)
-            slip = min(slip, max(available, 0.0))
-        buy_bound = buy.px_round(plan.buy_limit * (1.0 + slip), round_up=False)
-        sell_bound = sell.px_round(plan.sell_limit * (1.0 - slip), round_up=True)
+        hedge_slip_cfg = self.cfg.hedge_leg_slippage_bps
+        asymmetric = (
+            hedge_slip_cfg is not None
+            and buy.key != sell.key
+            and "hedge" in (buy.key, sell.key)
+        )
+        if asymmetric:
+            hedge_cap = min(slip, hedge_slip_cfg / 1e4)
+            buy_is_hedge = (buy.key == "hedge")
+            if self.cfg.check_worst_case_spread:
+                buy_fee = self.effective_fee_bps(buy) / 1e4
+                sell_fee = self.effective_fee_bps(sell) / 1e4
+                net_buy = plan.buy_limit * (1.0 + buy_fee)
+                net_sell = plan.sell_limit * (1.0 - sell_fee)
+                required = 1.0 + self._required_spread_bps(
+                    buy, sell, reduce_only=reduce_only, now=now) / 1e4
+                if not (math.isfinite(net_buy) and math.isfinite(net_sell)
+                        and math.isfinite(required) and min(net_buy, net_sell, required) > 0.0):
+                    return None
+                required_value = required * net_buy
+                if buy_is_hedge:
+                    max_feas_buy = (net_sell / required_value) - 1.0
+                    buy_slip = min(hedge_cap, max(max_feas_buy, 0.0))
+                    buy_bound = buy.px_round(plan.buy_limit * (1.0 + buy_slip), round_up=False)
+                    if not (math.isfinite(buy_bound) and buy_bound > 0.0):
+                        return None
+                    eff_buy_actual = buy_bound * (1.0 + buy_fee)
+                    sell_avail = 1.0 - (required * eff_buy_actual) / net_sell
+                    sell_slip = min(slip, max(sell_avail, 0.0))
+                    sell_bound = sell.px_round(plan.sell_limit * (1.0 - sell_slip), round_up=True)
+                else:
+                    max_feas_sell = 1.0 - required_value / net_sell
+                    sell_slip = min(hedge_cap, max(max_feas_sell, 0.0))
+                    sell_bound = sell.px_round(plan.sell_limit * (1.0 - sell_slip), round_up=True)
+                    if not (math.isfinite(sell_bound) and sell_bound > 0.0):
+                        return None
+                    eff_sell_actual = sell_bound * (1.0 - sell_fee)
+                    buy_avail = (eff_sell_actual / required_value) - 1.0
+                    buy_slip = min(slip, max(buy_avail, 0.0))
+                    buy_bound = buy.px_round(plan.buy_limit * (1.0 + buy_slip), round_up=False)
+            else:
+                buy_slip = hedge_cap if buy_is_hedge else slip
+                sell_slip = slip if buy_is_hedge else hedge_cap
+                buy_bound = buy.px_round(plan.buy_limit * (1.0 + buy_slip), round_up=False)
+                sell_bound = sell.px_round(plan.sell_limit * (1.0 - sell_slip), round_up=True)
+        else:
+            if self.cfg.check_worst_case_spread:
+                net_buy = plan.buy_limit * (1.0 + self.effective_fee_bps(buy) / 1e4)
+                net_sell = plan.sell_limit * (1.0 - self.effective_fee_bps(sell) / 1e4)
+                required = 1.0 + self._required_spread_bps(
+                    buy, sell, reduce_only=reduce_only, now=now) / 1e4
+                if not (math.isfinite(net_buy) and math.isfinite(net_sell)
+                        and math.isfinite(required) and min(net_buy, net_sell, required) > 0.0):
+                    return None
+                # For slippage s on each leg, require
+                # net_sell * (1-s) >= required * net_buy * (1+s).
+                required_value = required * net_buy
+                available = (net_sell - required_value) / (net_sell + required_value)
+                slip = min(slip, max(available, 0.0))
+            buy_bound = buy.px_round(plan.buy_limit * (1.0 + slip), round_up=False)
+            sell_bound = sell.px_round(plan.sell_limit * (1.0 - slip), round_up=True)
         if not (math.isfinite(buy_bound) and math.isfinite(sell_bound)
                 and buy_bound > 0.0 and sell_bound > 0.0):
             return None
@@ -975,6 +1070,16 @@ class Engine:
         )[0]:
             return None
         return buy_bound, sell_bound
+
+    def _entropy_first_follow_slip(self) -> float:
+        raw = (
+            self.cfg.entropy_first_hedge_slippage_bps
+            if self.cfg.entropy_first_hedge_slippage_bps is not None
+            else self.cfg.hedge_slippage_bps
+        )
+        if self.cfg.hedge_max_slippage_bps > 0.0:
+            raw = min(raw, self.cfg.hedge_max_slippage_bps)
+        return max(raw, 0.0) / 1e4
 
     def _prepare_pair_order(
         self, buy, sell, plan: ArbPlan, *, reduce_only: bool, now: float,
@@ -1000,6 +1105,20 @@ class Engine:
         # A sell limit is a price floor. Use the current best bid as the
         # snapshot ceiling for the sell leg, allowing for price improvement.
         order_price = max(buy_bound, sell_best, sell_bound)
+        if (self.cfg.execution_mode == "entropy_first"
+                and buy.key != sell.key and sell.key == "entropy"):
+            # Pre-reserve the follow-up hedge buy's protection price so normal
+            # fills fit inside max_order_notional without trimming follow_qty.
+            buy_best = buy.book.best_ask()
+            if buy_best is None or not math.isfinite(buy_best) or buy_best <= 0:
+                return None
+            projected_follow = buy.px_round(
+                buy_best * (1.0 + self._entropy_first_follow_slip()),
+                round_up=False,
+            )
+            if not math.isfinite(projected_follow) or projected_follow <= 0:
+                return None
+            order_price = max(order_price, buy_best, projected_follow)
         qty = floor_step(min(qty, cap / order_price), self._step)
         if qty <= 0.0 or qty < self._min_base or qty * order_price > cap + 1e-9:
             return None
@@ -1080,6 +1199,17 @@ class Engine:
         age = venue.book.age_mono(now_mono)
         return age is not None and age <= limit
 
+    def _entry_book_fresh(self, venue, *, reduce_only: bool,
+                          now_mono: Optional[float] = None) -> bool:
+        """Apply optional tighter quote-age cap strictly to new entries without
+        triggering watchdog WebSocket disconnects or blocking reduce-only exits."""
+        if not self._trade_book_fresh(venue, reduce_only=reduce_only, now_mono=now_mono):
+            return False
+        if not reduce_only and self.cfg.max_entry_book_age_sec > 0.0:
+            age = venue.book.age_mono(now_mono)
+            return age is not None and age <= self.cfg.max_entry_book_age_sec
+        return True
+
     def _check_book_age_guard(self, now_mono: Optional[float] = None, *,
                               reconnect: bool = False, reduce_only: bool = False) -> bool:
         limit = self.book_age_limit(reduce_only=reduce_only)
@@ -1105,8 +1235,9 @@ class Engine:
         return ok
 
     def _book_watchdog_tick(self) -> None:
+        has_position = any(abs(v.position) > 1e-12 for v in self.venues.values())
         reduce_only = not self.record_only and self.is_reduce_only()
-        self._check_book_age_guard(reconnect=True, reduce_only=reduce_only)
+        self._check_book_age_guard(reconnect=True, reduce_only=(reduce_only and has_position))
         # The first fresh snapshot may arrive during an unhedgeable cooldown.
         # Wake the strategy after that cooldown even if no new update arrives.
         net = self._net_position()
@@ -1165,6 +1296,7 @@ class Engine:
         for key in keys:
             self._armed[key] = None
             self._last_eligible.pop(key, None)
+            self._armed_entropy_mono.pop(key, None)
 
     async def _evaluate(self) -> None:
         cfg = self.cfg
@@ -1239,13 +1371,13 @@ class Engine:
 
     def _scan(self, now: float, now_mono: Optional[float] = None):
         cfg = self.cfg
-        if self.halted or self.has_pending_reconcile():
+        if self.halted or self.has_pending_reconcile() or self._bg_tasks:
             self._reset_signal()
             return None
 
         signal_time = time.monotonic() if now_mono is None else now_mono
         reduce_only_hint = self.is_reduce_only(now)
-        if not all(self._trade_book_fresh(venue, reduce_only=reduce_only_hint,
+        if not all(self._entry_book_fresh(venue, reduce_only=reduce_only_hint,
                                           now_mono=signal_time)
                    for venue in (self.entropy, self.hedge)):
             self._reset_signal()
@@ -1291,7 +1423,7 @@ class Engine:
             self._signal_reduce_only = reduce_only
         # A loss breaker can change the applicable age limit during this scan.
         if reduce_only != reduce_only_hint and not all(
-            self._trade_book_fresh(venue, reduce_only=reduce_only, now_mono=signal_time)
+            self._entry_book_fresh(venue, reduce_only=reduce_only, now_mono=signal_time)
             for venue in (self.entropy, self.hedge)
         ):
             return None
@@ -1329,12 +1461,19 @@ class Engine:
             self._last_eligible[dkey] = signal_time
             if armed is None or not 0.0 <= signal_time - last_eligible <= MAX_SIGNAL_GAP_SEC:
                 self._armed[dkey] = signal_time
+                self._armed_entropy_mono[dkey] = self.entropy.book.last_update_mono
                 self._schedule_poke(min(cfg.premium_persist_sec, MAX_SIGNAL_GAP_SEC / 2))
                 continue
             remaining = cfg.premium_persist_sec - (signal_time - armed)
             if remaining > 0.0:
                 self._schedule_poke(min(remaining, MAX_SIGNAL_GAP_SEC / 2))
                 continue
+            if cfg.require_entropy_update_on_persist and cfg.premium_persist_sec > 0.0:
+                armed_e_mono = self._armed_entropy_mono.get(dkey)
+                if (armed_e_mono is not None
+                        and self.entropy.book.last_update_mono <= armed_e_mono):
+                    self._schedule_poke(min(0.2, MAX_SIGNAL_GAP_SEC / 2))
+                    continue
             if best is None or plan.exp_edge_usd > best[2].exp_edge_usd:
                 best = (buy, sell, plan)
         return best
@@ -1380,6 +1519,12 @@ class Engine:
         elif abs(self._inv_signed_qty) > abs(real_matched) + 1e-12:
             self._inv_signed_qty = real_matched
 
+    def _pair_entry_edge(self, sell, buy_px: float, sell_px: float, fee_per_unit: float) -> float:
+        mid = self.current_midline_bps() / 1e4
+        if sell.key == "entropy":
+            return sell_px - buy_px * (1.0 + mid) - fee_per_unit
+        return sell_px * (1.0 + mid) - buy_px - fee_per_unit
+
     def _attribute_pair_pnl(
         self, buy, sell, matched: float, buy_px: float, sell_px: float,
         buy_fee_unit: float, sell_fee_unit: float,
@@ -1398,13 +1543,8 @@ class Engine:
         """
         fee_per_unit = buy_fee_unit + sell_fee_unit
         cash_per_unit = (sell_px - buy_px) - fee_per_unit
-        mid = self.current_midline_bps() / 1e4
-        if sell.key == "entropy":
-            half_turn_per_unit = (sell_px - buy_px * (1.0 + mid)) - fee_per_unit
-            fill_sign = -1.0
-        else:
-            half_turn_per_unit = (sell_px * (1.0 + mid) - buy_px) - fee_per_unit
-            fill_sign = 1.0
+        half_turn_per_unit = self._pair_entry_edge(sell, buy_px, sell_px, fee_per_unit)
+        fill_sign = -1.0 if sell.key == "entropy" else 1.0
 
         cur_signed = self._inv_signed_qty
         closing_qty = 0.0
@@ -1448,37 +1588,110 @@ class Engine:
 
         return pnl_delta, streak_pnl
 
-    async def _verify_fill_fee_bg(
-        self, v, *, order_id, client_order_id, filled: float, est_fee_usd: float,
-    ) -> None:
-        """Background fee verification used on imbalanced fills so hedging is never delayed."""
+    async def _lookup_deferred_fee(self, v, info: dict, filled: float) -> Optional[Tuple[float, float]]:
         try:
-            verified = await v.fetch_fill_fee(
-                order_id=order_id,
-                client_order_id=client_order_id,
+            verified = await asyncio.wait_for(v.fetch_fill_fee(
+                order_id=info.get("order_id"),
+                client_order_id=info.get("client_order_id"),
                 coin=getattr(v, "coin", None),
-            )
+            ), timeout=min(self.cfg.settle_timeout_sec, 5.0))
+            if verified is None or not math.isclose(
+                float(verified["filled_base"]), filled, rel_tol=0.0, abs_tol=1e-9
+            ):
+                return None
+            fee, rate = float(verified["fee_usd"]), float(verified["fee_bps"])
+            if not (math.isfinite(fee) and math.isfinite(rate) and fee >= 0 and rate >= 0):
+                return None
+            return fee, rate
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log.debug("[%s] async fill fee verify failed: %r", v.name, e)
-            return
-        if verified is None or not math.isclose(
-            verified.get("filled_base", 0.0), filled, rel_tol=0.0, abs_tol=1e-9
-        ):
-            return
-        actual_fee = float(verified["fee_usd"])
-        delta_fee = actual_fee - est_fee_usd
-        v.cash -= delta_fee
-        self._ensure_daily_breakdown()
-        self.daily_pnl_breakdown["estimated_fee_usd"] = max(
-            0.0, self.daily_pnl_breakdown["estimated_fee_usd"] - est_fee_usd
-        )
-        self.daily_pnl_breakdown["actual_fee_usd"] += actual_fee
-        if v.key == "entropy" or getattr(v, "kind", None) == "hl":
-            self._handle_fee_observation(float(verified["fee_bps"]), venue_key=v.key)
+            return None
+
+    async def _verify_fill_fees_bg(
+        self, checks, *, pair_id: str, matched_qty: float, opened_qty: float,
+        fill_sign: float, basis_qty: float, opening_edge: float,
+        streak_pnl: float, booked_day: str, trade: dict,
+        initial_delay: float = 0.0,
+    ) -> None:
+        """Reconcile fees as a batch without blocking an emergency single-leg hedge."""
+        if initial_delay > 0.0:
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=initial_delay)
+                return
+            except asyncio.TimeoutError:
+                pass
+        verified = await asyncio.gather(*(
+            self._lookup_deferred_fee(venue, info, filled)
+            for venue, info, filled, _ in checks
+        ))
+        same_day = self._ensure_daily_breakdown() == booked_day
+        total_delta = matched_fee_per_unit = 0.0
+        for (venue, _, filled, estimate), actual in zip(checks, verified):
+            if actual is None:
+                continue
+            fee, rate = actual
+            delta = fee - estimate
+            venue.cash -= delta
+            total_delta += delta
+            per_unit = delta / filled
+            matched_fee_per_unit += per_unit
+            if same_day:
+                self.daily_pnl_breakdown["estimated_fee_usd"] = max(
+                    0.0, self.daily_pnl_breakdown["estimated_fee_usd"] - estimate)
+                self.daily_pnl_breakdown["actual_fee_usd"] += fee
+            self._handle_fee_observation(rate, venue_key=venue.key)
+            # A confirmed leg may be waiting for its sibling. Update the
+            # pending journal so late settlement uses the same actual fee.
+            for pending in self._pending_orders.values():
+                sibling = pending.get("pair_ctx")
+                if (pending.get("pair_id") == pair_id and isinstance(sibling, dict)
+                        and sibling.get("sibling_venue") == venue.key):
+                    sibling["sibling_fee_unit"] = fee / filled
+
+        if not same_day and self._daily_mtm_day == self.circuit_breaker.day_for():
+            if self._daily_mtm_baseline is not None:
+                self._daily_mtm_baseline -= total_delta
+
+        # Until this batch finishes, new paired orders and pending settlement
+        # cannot change the inventory basis. A concurrent single-leg hedge
+        # can only trim it; prorate the cost if some inventory was removed.
+        self._sync_inv_basis_to_positions()
+        remaining = abs(self._inv_signed_qty)
+        if basis_qty > 0 and remaining > 0 and self._inv_signed_qty * fill_sign > 0:
+            surviving = opened_qty * min(1.0, remaining / basis_qty)
+            change = surviving * matched_fee_per_unit / remaining
+            self._inv_avg_cash -= change
+            self._inv_avg_booked -= change
+
+        correction = matched_qty * matched_fee_per_unit
+        self.total_fill_edge -= correction
+        if trade["fill"] is not None:
+            trade["fill"] -= correction
+        if same_day:
+            closing_fee = (matched_qty - opened_qty) * matched_fee_per_unit
+            opening_after_fees = opening_edge - opened_qty * matched_fee_per_unit
+            corrected_streak = (streak_pnl - closing_fee
+                                + min(0.0, opening_after_fees) - min(0.0, opening_edge))
+            tripped, reason = self.circuit_breaker.record_trade_pnl(
+                -correction if matched_qty else 0.0, mtm_pnl_usd=self.daily_mtm_pnl(),
+                count_streak=matched_qty > 0, streak_pnl_usd=corrected_streak)
+            self._handle_loss_breaker(tripped, reason)
+        if self.state_store is not None and not self.save_state():
+            self._stop_on_state_error("could not persist verified fill fees")
+
+    def _fee_batch_done(self, task: asyncio.Task) -> None:
+        self._bg_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            log.error("fee verification batch failed: %s", task.exception())
+            self._stop_on_state_error("deferred fill fee accounting failed")
+        self._reconcile_evt.set()
+        self._update_evt.set()
 
     async def _execute_pair(self, buy, sell, plan: ArbPlan, reduce_only: bool) -> bool:
+        if self._bg_tasks:
+            return False
         cfg = self.cfg
         now = time.time()
         send_reduce_only = bool(reduce_only or self.is_reduce_only(now))
@@ -1488,7 +1701,7 @@ class Engine:
         if (not (buy.ready_to_trade() and sell.ready_to_trade())
                 or self._venue_down
                 or self._venue_limited(buy) or self._venue_limited(sell)
-                or not all(self._trade_book_fresh(venue, reduce_only=send_reduce_only,
+                or not all(self._entry_book_fresh(venue, reduce_only=send_reduce_only,
                                                   now_mono=checked_at)
                            for venue in (buy, sell))):
             log.warning("[PRE-SEND BLOCKED] %s %s/%s: venue readiness or book freshness changed",
@@ -1515,34 +1728,171 @@ class Engine:
                  buy.name, qty, plan.buy_limit, sell.name,
                  plan.sell_limit, plan.buy_notional, plan.q_max_notional,
                  plan.marginal_premium_bps, plan.exp_edge_usd)
-        # Persist both client IDs as "attempted" in ONE atomic fsync before firing
-        # both legs concurrently (zero fsync stagger between leg 1 and leg 2).
-        ids = self._stage_orders(
-            ((buy, True, buy_bound), (sell, False, sell_bound)),
-            qty=qty, purpose="arb", reduce_only=send_reduce_only,
-            submission="attempted",
+
+        entropy_first = (
+            cfg.execution_mode == "entropy_first"
+            and buy.key != sell.key
+            and "entropy" in (buy.key, sell.key)
         )
-        if ids is None:
-            return False
-        checked_at = time.monotonic()
-        if not all(self._trade_book_fresh(venue, reduce_only=send_reduce_only,
-                                          now_mono=checked_at)
-                   for venue in (buy, sell)):
-            # No adapter was called. Checkpoint the removal of both known-unsent IDs.
-            not_submitted = {"unresolved": False}
-            self._commit_orders(ids, ((buy, not_submitted), (sell, not_submitted)))
-            log.warning("[PRE-SEND BLOCKED] %s %s/%s: book expired during order staging",
-                        order_type, buy.name, sell.name)
-            return False
-        self.last_trade_ts = now
-        self._record_send(buy)
-        self._record_send(sell)
-        binfo, sinfo = await asyncio.gather(
-            self._send_staged_order(buy, ids, is_buy=True, qty=qty, limit_px=buy_bound,
-                                    reduce_only=send_reduce_only),
-            self._send_staged_order(sell, ids, is_buy=False, qty=qty, limit_px=sell_bound,
-                                    reduce_only=send_reduce_only),
-        )
+        buy_sent_qty = sell_sent_qty = qty
+        buy_sent_bound, sell_sent_bound = buy_bound, sell_bound
+        sent_buy = sent_sell = True
+        if entropy_first:
+            entropy_is_buy = (buy.key == "entropy")
+            first_venue, first_is_buy, first_bound = (
+                (buy, True, buy_bound) if entropy_is_buy else (sell, False, sell_bound)
+            )
+            second_venue, second_is_buy, second_bound = (
+                (sell, False, sell_bound) if entropy_is_buy else (buy, True, buy_bound)
+            )
+            ids = self._stage_orders(
+                ((first_venue, first_is_buy, first_bound),),
+                qty=qty, purpose="arb", reduce_only=send_reduce_only,
+                submission="attempted",
+            )
+            if ids is None:
+                return False
+            checked_at = time.monotonic()
+            if not all(self._entry_book_fresh(venue, reduce_only=send_reduce_only,
+                                              now_mono=checked_at)
+                       for venue in (buy, sell)):
+                not_submitted = {"unresolved": False}
+                self._commit_orders(ids, ((first_venue, not_submitted),))
+                log.warning("[PRE-SEND BLOCKED] %s %s/%s: book expired during order staging",
+                            order_type, buy.name, sell.name)
+                return False
+            self.last_trade_ts = now
+            self._record_send(first_venue)
+            first_info = await self._send_staged_order(
+                first_venue, ids, is_buy=first_is_buy, qty=qty, limit_px=first_bound,
+                reduce_only=send_reduce_only,
+            )
+            first_fill = float(first_info.get("filled_base") or 0.0)
+            first_unresolved = bool(first_info.get("unresolved"))
+            second_sent = False
+            follow_qty = qty
+            follow_bound = second_bound
+            if not first_unresolved and first_fill > 0.0:
+                follow_qty = floor_step(first_fill, self._step)
+                follow_slip = self._entropy_first_follow_slip()
+                ref = (second_venue.book.best_ask() if second_is_buy
+                       else second_venue.book.best_bid())
+                can_follow = (
+                    not self.stop.is_set()
+                    and not self._state_fault
+                    and second_venue.ready_to_trade()
+                    and second_venue.key not in self._venue_down
+                    and not self._venue_limited(second_venue)
+                    and self._venue_rate_ok(second_venue)
+                    and self._trade_book_fresh(second_venue, reduce_only=True)
+                    and ref is not None and math.isfinite(ref) and ref > 0.0
+                )
+                if can_follow:
+                    follow_bound = second_venue.px_round(
+                        ref * (1.0 + follow_slip) if second_is_buy else ref * (1.0 - follow_slip),
+                        round_up=not second_is_buy,
+                    )
+                    if not (math.isfinite(follow_bound) and follow_bound > 0.0):
+                        can_follow = False
+                    else:
+                        follow_order_price = max(ref, follow_bound)
+                        follow_qty = floor_step(
+                            min(follow_qty, cfg.max_order_notional / follow_order_price),
+                            self._step,
+                        )
+                        venue_step = 10 ** -second_venue.size_decimals
+                        is_full_close = (
+                            send_reduce_only
+                            and abs(second_venue.position) >= venue_step - 1e-12
+                            and (second_venue.position < 0 if second_is_buy else second_venue.position > 0)
+                            and math.isclose(
+                                follow_qty, floor_step(abs(second_venue.position), venue_step),
+                                rel_tol=0.0, abs_tol=1e-9,
+                            )
+                        )
+                        min_base_req = venue_step if is_full_close else second_venue.min_base
+                        min_notional_ok = (
+                            is_full_close
+                            or follow_qty * min(ref, follow_bound)
+                            >= max(cfg.min_order_notional, second_venue.min_quote)
+                        )
+                        can_follow = (
+                            follow_qty >= max(min_base_req, 1e-12)
+                            and follow_qty * follow_order_price <= cfg.max_order_notional + 1e-9
+                            and min_notional_ok
+                        )
+                if can_follow:
+                    if self._stage_followup_order(
+                        ids, second_venue, is_buy=second_is_buy, qty=follow_qty,
+                        limit_px=follow_bound, purpose="arb", reduce_only=send_reduce_only,
+                    ):
+                        log.info("[ARB-FOLLOW] %s%s: %s %s %.6g @%.6g (matched %s fill %.6g)",
+                                 direction, " [RO]" if send_reduce_only else "",
+                                 "BUY" if second_is_buy else "SELL",
+                                 second_venue.name, follow_qty, follow_bound,
+                                 first_venue.name, first_fill)
+                        self._record_send(second_venue)
+                        second_sent = True
+                        second_info = await self._send_staged_order(
+                            second_venue, ids, is_buy=second_is_buy, qty=follow_qty,
+                            limit_px=follow_bound, reduce_only=send_reduce_only,
+                        )
+                    else:
+                        second_info = {
+                            "status": "not-submitted", "outcome": "rejected",
+                            "filled_base": 0.0, "avg_px": None,
+                            "err": "order journal unavailable",
+                            "unresolved": False, "client_order_id": None,
+                        }
+                else:
+                    second_info = {
+                        "status": "skipped", "outcome": "skipped",
+                        "filled_base": 0.0, "avg_px": None,
+                        "err": None, "unresolved": False, "client_order_id": None,
+                    }
+            else:
+                second_info = {
+                    "status": "skipped", "outcome": "skipped",
+                    "filled_base": 0.0, "avg_px": None,
+                    "err": None, "unresolved": False, "client_order_id": None,
+                }
+            if entropy_is_buy:
+                binfo, sinfo = first_info, second_info
+                sent_buy, sent_sell = True, second_sent
+                sell_sent_qty, sell_sent_bound = follow_qty, follow_bound
+            else:
+                binfo, sinfo = second_info, first_info
+                sent_buy, sent_sell = second_sent, True
+                buy_sent_qty, buy_sent_bound = follow_qty, follow_bound
+        else:
+            # Persist both client IDs as "attempted" in ONE atomic fsync before firing
+            # both legs concurrently (zero fsync stagger between leg 1 and leg 2).
+            ids = self._stage_orders(
+                ((buy, True, buy_bound), (sell, False, sell_bound)),
+                qty=qty, purpose="arb", reduce_only=send_reduce_only,
+                submission="attempted",
+            )
+            if ids is None:
+                return False
+            checked_at = time.monotonic()
+            if not all(self._entry_book_fresh(venue, reduce_only=send_reduce_only,
+                                              now_mono=checked_at)
+                       for venue in (buy, sell)):
+                # No adapter was called. Checkpoint the removal of both known-unsent IDs.
+                not_submitted = {"unresolved": False}
+                self._commit_orders(ids, ((buy, not_submitted), (sell, not_submitted)))
+                log.warning("[PRE-SEND BLOCKED] %s %s/%s: book expired during order staging",
+                            order_type, buy.name, sell.name)
+                return False
+            self.last_trade_ts = now
+            self._record_send(buy)
+            self._record_send(sell)
+            binfo, sinfo = await asyncio.gather(
+                self._send_staged_order(buy, ids, is_buy=True, qty=qty, limit_px=buy_bound,
+                                        reduce_only=send_reduce_only),
+                self._send_staged_order(sell, ids, is_buy=False, qty=qty, limit_px=sell_bound,
+                                        reduce_only=send_reduce_only),
+            )
 
         bfill = float(binfo.get("filled_base") or 0.0)
         sfill = float(sinfo.get("filled_base") or 0.0)
@@ -1553,6 +1903,7 @@ class Engine:
 
         # P1-3: verify actual fees (via userFillsByTime when HL IOC receipt omits fee).
         # When imbalanced, NEVER block hedging on a REST fee lookup — defer to background task.
+        # On balanced fills where exchange indexing lags, retry in background if configured.
         deferred_fee_checks = []
         for v, info, side in (
             (buy, binfo, "buy"),
@@ -1585,7 +1936,7 @@ class Engine:
                         self._handle_fee_observation(float(info["fee_bps"]), venue_key=v.key)
                 else:
                     info["fee_estimated"] = True
-                    if can_verify and imbalanced:
+                    if can_verify and (imbalanced or cfg.fill_fee_retry_delay_sec > 0.0):
                         deferred_fee_checks.append((v, info, filled))
 
         # Apply confirmed fills once (with client_order_id deduplication)
@@ -1609,8 +1960,8 @@ class Engine:
         posted_px: Dict[str, float] = {}
         posted_est_fee: Dict[str, float] = {}
         for v, info, filled, cid, fallback_px, fee_rate, sign in (
-            (buy, binfo, bfill, b_cid, buy_bound, b_fee_rate, 1),
-            (sell, sinfo, sfill, s_cid, sell_bound, s_fee_rate, -1),
+            (buy, binfo, bfill, b_cid, buy_sent_bound, b_fee_rate, 1),
+            (sell, sinfo, sfill, s_cid, sell_sent_bound, s_fee_rate, -1),
         ):
             if filled <= 0.0 or (cid and f"{v.key}:{cid}" in self._settled_order_ids):
                 continue
@@ -1633,26 +1984,14 @@ class Engine:
             self.daily_pnl_breakdown["actual_fee_usd"] += actual_fee_total
             self.daily_pnl_breakdown["estimated_fee_usd"] += est_fee_total
 
-        for v, info, filled in deferred_fee_checks:
-            if v.key in posted_est_fee:
-                bt = asyncio.create_task(
-                    self._verify_fill_fee_bg(
-                        v,
-                        order_id=info.get("order_id"),
-                        client_order_id=info.get("client_order_id"),
-                        filled=filled,
-                        est_fee_usd=posted_est_fee[v.key],
-                    ),
-                    name=f"fee-verify-{v.key}",
-                )
-                self._bg_tasks.add(bt)
-                bt.add_done_callback(self._bg_tasks.discard)
+        deferred_checks = [(v, info, filled, posted_est_fee[v.key])
+                           for v, info, filled in deferred_fee_checks if v.key in posted_est_fee]
 
         unresolved = False
         pair_id = f"{b_cid or ''}:{s_cid or ''}:{int(now * 1000)}"
-        for v, info, is_buy, bound, other, other_is_buy in (
-            (buy, binfo, True, buy_bound, sell, False),
-            (sell, sinfo, False, sell_bound, buy, True),
+        for v, info, is_buy, leg_qty, bound, other, other_is_buy in (
+            (buy, binfo, True, buy_sent_qty, buy_sent_bound, sell, False),
+            (sell, sinfo, False, sell_sent_qty, sell_sent_bound, buy, True),
         ):
             cid = info.get("client_order_id")
             key = f"{v.key}:{cid}" if cid is not None else None
@@ -1672,7 +2011,7 @@ class Engine:
                         "sibling_fee_unit": other_fee_unit,
                     }
                 self._register_pending_order(
-                    v, cid, is_buy=is_buy, qty=qty, limit_px=bound,
+                    v, cid, is_buy=is_buy, qty=leg_qty, limit_px=bound,
                     known_filled=known_fill, purpose="arb", reduce_only=send_reduce_only,
                     persist=False, pair_id=pair_id, pair_ctx=pair_ctx,
                 )
@@ -1685,8 +2024,16 @@ class Engine:
         fill_edge = 0.0
         pnl_delta = 0.0
         streak_pnl = 0.0
+        attributed_qty = opened_qty = opening_edge = 0.0
+        fill_sign = 1.0 if buy.key == "entropy" else -1.0
         if matched > 0 and binfo.get("avg_px") and sinfo.get("avg_px"):
             self._sync_inv_basis_to_positions(pre_e_pos, pre_h_pos)
+            attributed_qty = matched
+            closing_qty = (min(matched, abs(self._inv_signed_qty))
+                           if self._inv_signed_qty * fill_sign < 0 else 0.0)
+            opened_qty = matched - closing_qty
+            opening_edge = opened_qty * self._pair_entry_edge(
+                sell, binfo["avg_px"], sinfo["avg_px"], buy_fee_unit + sell_fee_unit)
             gross_spread = matched * (sinfo["avg_px"] - binfo["avg_px"])
             fill_edge = gross_spread - matched * (buy_fee_unit + sell_fee_unit)
             pnl_delta, streak_pnl = self._attribute_pair_pnl(
@@ -1701,17 +2048,21 @@ class Engine:
 
         log.info("[SETTLED] %s: buy %s %s %.6g/%.6g | sell %s %s %.6g/%.6g | "
                  "matched %.6g | fill edge $%.4f (actFee=$%.4f estFee=$%.4f)",
-                 direction, buy.name, binfo["status"], bfill, qty,
-                 sell.name, sinfo["status"], sfill, qty, matched,
+                 direction, buy.name, binfo["status"], bfill, buy_sent_qty,
+                 sell.name, sinfo["status"], sfill, sell_sent_qty, matched,
                  fill_edge, actual_fee_total, est_fee_total)
-        buy.last_traded_ts = sell.last_traded_ts = time.time()
+        settled_now = time.time()
+        if sent_buy:
+            buy.last_traded_ts = settled_now
+        if sent_sell:
+            sell.last_traded_ts = settled_now
 
         if abs(bfill - sfill) > cfg.net_tolerance_base:
             self.notifier.notify(
                 "legging_failure",
                 f"⚠️ Legging failure ({direction}): "
-                f"BUY {buy.name} {bfill:.6g}/{qty:.6g} ({binfo['status']}) | "
-                f"SELL {sell.name} {sfill:.6g}/{qty:.6g} ({sinfo['status']}) | "
+                f"BUY {buy.name} {bfill:.6g}/{buy_sent_qty:.6g} ({binfo['status']}) | "
+                f"SELL {sell.name} {sfill:.6g}/{sell_sent_qty:.6g} ({sinfo['status']}) | "
                 f"imbalance {bfill - sfill:+.6g}",
             )
 
@@ -1751,7 +2102,7 @@ class Engine:
             tripped, reason = self.circuit_breaker.record_trade_pnl(
                 pnl_delta,
                 mtm_pnl_usd=self.daily_mtm_pnl(),
-                streak_pnl_usd=streak_pnl,
+                count_streak=not deferred_checks, streak_pnl_usd=streak_pnl,
             )
             self._handle_loss_breaker(tripped, reason)
 
@@ -1761,7 +2112,18 @@ class Engine:
         self._log_csv(direction, buy, sell, plan, paired_fill, bfill, sfill,
                       binfo["status"], sinfo["status"], fill_edge, inv_bps)
         self.last_trade_ts = time.time()
-        self._commit_orders(ids, ((buy, binfo), (sell, sinfo)))
+        committed = self._commit_orders(ids, ((buy, binfo), (sell, sinfo)))
+        if committed and deferred_checks:
+            fee_delay = 0.0 if imbalanced else cfg.fill_fee_retry_delay_sec
+            task = asyncio.create_task(self._verify_fill_fees_bg(
+                deferred_checks, pair_id=pair_id, matched_qty=attributed_qty,
+                opened_qty=opened_qty, fill_sign=fill_sign, basis_qty=abs(self._inv_signed_qty),
+                opening_edge=opening_edge, streak_pnl=streak_pnl,
+                booked_day=self.circuit_breaker.day_for(), trade=self.recent_trades[-1],
+                initial_delay=fee_delay,
+            ), name="verify-pair-fill-fees")
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._fee_batch_done)
         return bool(unresolved)
 
     def _record_trade(self, direction: str, plan: ArbPlan, fill_edge,
@@ -1872,6 +2234,8 @@ class Engine:
                     # Round inward so the order's limit stays inside the slippage cap.
                     limit = v.px_round(ref * (1.0 - slip) if is_sell else ref * (1.0 + slip),
                                        round_up=is_sell)
+                    if not math.isfinite(limit) or limit <= 0.0:
+                        continue
                     order_price = max(ref, limit)
                     qty = floor_step(min(qty, cfg.max_order_notional / order_price), step)
                     full_venue_qty = floor_step(abs(v.position), venue_step)
@@ -1948,9 +2312,16 @@ class Engine:
                             v.position += -fill if is_sell else fill
                             self._sync_inv_basis_to_positions()
                             px = info.get("avg_px") or limit
-                            fee = self.effective_fee_bps(v) / 1e4
-                            v.cash += fill * px * (1.0 - fee) if is_sell \
-                                else -fill * px * (1.0 + fee)
+                            if info.get("fee_bps") is not None and (
+                                v.key == "entropy" or getattr(v, "kind", None) == "hl"
+                            ):
+                                self._handle_fee_observation(float(info["fee_bps"]), venue_key=v.key)
+                            fee_usd = (
+                                float(info["fee_usd"])
+                                if info.get("fee_usd") is not None
+                                else fill * px * self.effective_fee_bps(v) / 1e4
+                            )
+                            v.cash += (fill * px if is_sell else -fill * px) - fee_usd
                             v.volume_usd += fill * px
                             if ids:
                                 self._pending_orders[f"{v.key}:{ids[v.key]}"]["known_filled"] = fill
@@ -1958,10 +2329,8 @@ class Engine:
                             mid = v.book.mid()
                             if mid is not None:
                                 slip_pnl = (
-                                    fill * (px * (1.0 - fee) - mid)
-                                    if is_sell
-                                    else fill * (mid - px * (1.0 + fee))
-                                )
+                                    fill * (px - mid) if is_sell else fill * (mid - px)
+                                ) - fee_usd
                                 self._ensure_daily_breakdown()
                                 self.daily_pnl_breakdown["hedge_pnl_usd"] += slip_pnl
                                 tripped, reason = self.circuit_breaker.record_trade_pnl(
@@ -2046,7 +2415,8 @@ class Engine:
         Returns None when not executable, else `(made_progress, should_return, last_err)`.
         """
         cfg = self.cfg
-        if len(self.venues) != 2:
+        exposure_cap = cfg.risk.max_rebalance_exposure_usd
+        if exposure_cap <= 0 or len(self.venues) != 2 or self._bg_tasks:
             return None
         locks = [self._vlock(key) for key in sorted(self.venues)]
         if any(lock.locked() for lock in locks):
@@ -2183,6 +2553,17 @@ class Engine:
                     or q_under * under_order_px > cfg.max_order_notional + 1e-9):
                 return None
 
+            # IOC legs can fill independently. The maximum absolute exposure
+            # over all partial-fill combinations occurs at a corner, including
+            # the case where only the smaller (under) leg fills.
+            worst_net = max(abs(cur_net - sgn * q_over), abs(cur_net + sgn * q_under))
+            mark = max(over.book.best_ask(), under.book.best_ask(),
+                       over_order_px, under_order_px)
+            if worst_net * mark > exposure_cap + 1e-9:
+                self._skiplog("[HEDGE REBALANCE] worst single-leg exposure $%.4f exceeds limit $%.4f",
+                              worst_net * mark, exposure_cap)
+                return None
+
             over_buy = not is_sell_over
             under_buy = is_sell_over
             if not all(self._trade_book_fresh(v, reduce_only=True) for v in (over, under)):
@@ -2253,17 +2634,24 @@ class Engine:
                     total_filled += fill
                     v.position += fill if is_buy else -fill
                     px = info.get("avg_px") or bound
-                    fee = self.effective_fee_bps(v) / 1e4
-                    v.cash += -fill * px * (1.0 + fee) if is_buy else fill * px * (1.0 - fee)
+                    if info.get("fee_bps") is not None and (
+                        v.key == "entropy" or getattr(v, "kind", None) == "hl"
+                    ):
+                        self._handle_fee_observation(float(info["fee_bps"]), venue_key=v.key)
+                    fee_usd = (
+                        float(info["fee_usd"])
+                        if info.get("fee_usd") is not None
+                        else fill * px * self.effective_fee_bps(v) / 1e4
+                    )
+                    v.cash += (-fill * px if is_buy else fill * px) - fee_usd
                     v.volume_usd += fill * px
                     if ids and v.key in ids and f"{v.key}:{ids[v.key]}" in self._pending_orders:
                         self._pending_orders[f"{v.key}:{ids[v.key]}"]["known_filled"] = fill
                     mid = v.book.mid()
                     if mid is not None:
                         slip_pnl = (
-                            fill * (mid - px * (1.0 + fee))
-                            if is_buy else fill * (px * (1.0 - fee) - mid)
-                        )
+                            fill * (mid - px) if is_buy else fill * (px - mid)
+                        ) - fee_usd
                         self._ensure_daily_breakdown()
                         self.daily_pnl_breakdown["hedge_pnl_usd"] += slip_pnl
                         tripped, reason = self.circuit_breaker.record_trade_pnl(
@@ -2271,9 +2659,10 @@ class Engine:
                         )
                         self._handle_loss_breaker(tripped, reason)
 
+            if not unresolved:
+                self._sync_inv_basis_to_positions()
             if not self._commit_orders(ids, ((over, over_info), (under, under_info))):
                 return (False, True, "state checkpoint failed")
-            self._sync_inv_basis_to_positions()
             if unresolved:
                 return (False, True, "unresolved")
 
@@ -2294,7 +2683,7 @@ class Engine:
 
     async def _reconcile_pending_orders(self) -> bool:
         """Settle pending fills only when both position snapshots agree."""
-        if self._orders_in_flight:
+        if self._orders_in_flight or self._bg_tasks:
             return False
         if not self.has_pending_reconcile():
             return True
@@ -2392,6 +2781,10 @@ class Engine:
         for key, venue, rec, result, additional in settlements:
             if self._mark_order_settled(key) and additional > 0:
                 px = float(result.get("avg_px") or rec["limit_px"])
+                if result.get("fee_bps") is not None and (
+                    venue.key == "entropy" or getattr(venue, "kind", None) == "hl"
+                ):
+                    self._handle_fee_observation(float(result["fee_bps"]), venue_key=venue.key)
                 if result.get("fee_usd") is not None:
                     fee_usd = result["fee_usd"] * additional / result["filled_base"]
                     self.daily_pnl_breakdown["actual_fee_usd"] += fee_usd

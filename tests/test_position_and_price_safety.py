@@ -79,6 +79,8 @@ def test_subminimum_unmatched_exposure_blocks_new_pair():
     engine = make_engine("""
 sizing:
   max_order_notional_usd: 15
+risk:
+  max_rebalance_exposure_usd: 30
 """, hedge="lighter")
     engine._step, engine._min_base = 0.001, 0.025
     engine.entropy.size_decimals = 3

@@ -21,6 +21,7 @@ HEDGE_VENUES = ("lighter", "lighter-rh", "tradexyz")
 BREAKER_ACTIONS = ("reduce_only", "halt")
 OFF_HOURS_MODES = ("reduce_only", "throttle")
 DYNAMIC_MIDLINE_METHODS = ("ewma", "rolling_median")
+EXECUTION_MODES = ("parallel", "entropy_first")
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,7 @@ class RiskConf:
     reduce_only_ignore_session_buffer: bool = True
     max_book_age_sec: float = 0.0
     max_reduce_book_age_sec: float = 15.0
+    max_rebalance_exposure_usd: float = 0.0
     max_spread_bps: float = 0.0
     min_available_margin_usd: float = 0.0
     reconcile_drift_reduce_only: bool = True
@@ -196,6 +198,12 @@ class Config:
     reduce_only_min_worst_bps: float = -50.0
     reduce_only_exit_threshold_bps: Optional[float] = None
     pending_not_found_expire_sec: float = 120.0
+    execution_mode: str = "parallel"
+    hedge_leg_slippage_bps: Optional[float] = None
+    entropy_first_hedge_slippage_bps: Optional[float] = None
+    require_entropy_update_on_persist: bool = False
+    max_entry_book_age_sec: float = 0.0
+    fill_fee_retry_delay_sec: float = 0.0
     risk: RiskConf = field(default_factory=RiskConf)
     session_filter: SessionFilterConf = field(default_factory=SessionFilterConf)
     dynamic_midline: DynamicMidlineConf = field(default_factory=DynamicMidlineConf)
@@ -247,10 +255,15 @@ _SCHEMA: Dict[str, Any] = {
         "floor_frac": float,
     },
     "execution": {
+        "execution_mode": str,
         "premium_persist_sec": float,
+        "require_entropy_update_on_persist": bool,
+        "max_entry_book_age_sec": float,
         "cooldown_sec": float,
         "settle_timeout_sec": float,
         "leg_slippage_bps": float,
+        "hedge_leg_slippage_bps": (Optional, float),
+        "entropy_first_hedge_slippage_bps": (Optional, float),
         "hedge_slippage_bps": float,
         "hedge_max_retries": int,
         "hedge_retry_delay_sec": float,
@@ -266,6 +279,7 @@ _SCHEMA: Dict[str, Any] = {
         "venue_probe_sec": float,
         "http_keepalive_sec": float,
         "pending_not_found_expire_sec": float,
+        "fill_fee_retry_delay_sec": float,
     },
     "risk": {
         "max_daily_loss_usd": float,
@@ -276,6 +290,7 @@ _SCHEMA: Dict[str, Any] = {
         "reduce_only_ignore_session_buffer": bool,
         "max_book_age_sec": float,
         "max_reduce_book_age_sec": float,
+        "max_rebalance_exposure_usd": float,
         "max_spread_bps": float,
         "min_available_margin_usd": float,
         "reconcile_drift_reduce_only": bool,
@@ -397,7 +412,12 @@ def _env_s(name: str) -> Optional[str]:
 
 def _env_i(name: str) -> Optional[int]:
     v = os.getenv(name)
-    return int(v) if v not in (None, "") else None
+    if v is None or not v.strip():
+        return None
+    try:
+        return int(v.strip())
+    except ValueError as e:
+        raise ConfigError(f"environment variable {name} must be an integer, got {v!r}") from e
 
 
 def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
@@ -454,16 +474,44 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
     reduce_only_min_worst_bps = float(_get(raw, "execution", "reduce_only_min_worst_bps", -50.0))
     raw_ro_exit = _get(raw, "execution", "reduce_only_exit_threshold_bps", None)
     reduce_only_exit_threshold_bps = None if raw_ro_exit is None else float(raw_ro_exit)
+    execution_mode = str(_get(raw, "execution", "execution_mode", "parallel"))
+    raw_hedge_leg_slip = _get(raw, "execution", "hedge_leg_slippage_bps", None)
+    hedge_leg_slippage_bps = None if raw_hedge_leg_slip is None else float(raw_hedge_leg_slip)
+    raw_ef_hedge_slip = _get(raw, "execution", "entropy_first_hedge_slippage_bps", None)
+    entropy_first_hedge_slippage_bps = (
+        None if raw_ef_hedge_slip is None else float(raw_ef_hedge_slip)
+    )
+    require_entropy_update_on_persist = bool(
+        _get(raw, "execution", "require_entropy_update_on_persist", False)
+    )
+    max_entry_book_age_sec = float(_get(raw, "execution", "max_entry_book_age_sec", 0.0))
+    fill_fee_retry_delay_sec = float(_get(raw, "execution", "fill_fee_retry_delay_sec", 0.0))
     settle_timeout_sec = float(_get(raw, "execution", "settle_timeout_sec", 5.0))
     leg_slippage_bps = float(_get(raw, "execution", "leg_slippage_bps", 50.0))
     hedge_slippage_bps = float(_get(raw, "execution", "hedge_slippage_bps", 20.0))
+    if execution_mode not in EXECUTION_MODES:
+        raise ConfigError(
+            f"execution.execution_mode must be one of {list(EXECUTION_MODES)}, "
+            f"got {execution_mode!r}")
     if settle_timeout_sec <= 0:
         raise ConfigError("execution.settle_timeout_sec must be > 0")
+    if reduce_only_min_worst_bps <= -10_000:
+        raise ConfigError("execution.reduce_only_min_worst_bps must be > -10000")
+    if reduce_only_exit_threshold_bps is not None and reduce_only_exit_threshold_bps <= -10_000:
+        raise ConfigError("execution.reduce_only_exit_threshold_bps must be > -10000")
     for name, value in (("leg_slippage_bps", leg_slippage_bps),
                         ("hedge_slippage_bps", hedge_slippage_bps),
                         ("hedge_max_slippage_bps", hedge_max_slippage_bps)):
         if not 0 <= value < 10_000:
             raise ConfigError(f"execution.{name} must be in [0, 10000)")
+    for name, value in (("hedge_leg_slippage_bps", hedge_leg_slippage_bps),
+                        ("entropy_first_hedge_slippage_bps", entropy_first_hedge_slippage_bps)):
+        if value is not None and not 0 <= value < 10_000:
+            raise ConfigError(f"execution.{name} must be in [0, 10000)")
+    if max_entry_book_age_sec < 0:
+        raise ConfigError("execution.max_entry_book_age_sec must be >= 0")
+    if fill_fee_retry_delay_sec < 0:
+        raise ConfigError("execution.fill_fee_retry_delay_sec must be >= 0")
     if hedge_max_retries < 1:
         raise ConfigError("execution.hedge_max_retries must be >= 1")
     if hedge_retry_delay_sec < 0:
@@ -479,6 +527,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
             _get(raw, "risk", "reduce_only_ignore_session_buffer", True)),
         max_book_age_sec=float(_get(raw, "risk", "max_book_age_sec", 0.0)),
         max_reduce_book_age_sec=float(_get(raw, "risk", "max_reduce_book_age_sec", 15.0)),
+        max_rebalance_exposure_usd=float(_get(raw, "risk", "max_rebalance_exposure_usd", 0.0)),
         max_spread_bps=float(_get(raw, "risk", "max_spread_bps", 0.0)),
         min_available_margin_usd=float(
             _get(raw, "risk", "min_available_margin_usd", 0.0)),
@@ -501,6 +550,8 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         raise ConfigError("risk.max_book_age_sec must be >= 0")
     if risk_conf.max_reduce_book_age_sec <= 0:
         raise ConfigError("risk.max_reduce_book_age_sec must be > 0")
+    if risk_conf.max_rebalance_exposure_usd < 0:
+        raise ConfigError("risk.max_rebalance_exposure_usd must be >= 0")
     if risk_conf.max_spread_bps < 0:
         raise ConfigError("risk.max_spread_bps must be >= 0")
     if risk_conf.min_available_margin_usd < 0:
@@ -732,6 +783,12 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         reduce_only_min_worst_bps=reduce_only_min_worst_bps,
         reduce_only_exit_threshold_bps=reduce_only_exit_threshold_bps,
         pending_not_found_expire_sec=pending_not_found_expire_sec,
+        execution_mode=execution_mode,
+        hedge_leg_slippage_bps=hedge_leg_slippage_bps,
+        entropy_first_hedge_slippage_bps=entropy_first_hedge_slippage_bps,
+        require_entropy_update_on_persist=require_entropy_update_on_persist,
+        max_entry_book_age_sec=max_entry_book_age_sec,
+        fill_fee_retry_delay_sec=fill_fee_retry_delay_sec,
         net_tolerance_base=net_tolerance_base,
         max_consecutive_errors=max_consecutive_errors,
         rate_limit_pause_sec=rate_limit_pause_sec,

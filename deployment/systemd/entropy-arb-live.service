@@ -1,0 +1,22 @@
+[Unit]
+Description=Entropy and Lighter NVDA small-size live test
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=entropyarb
+Group=entropyarb
+WorkingDirectory=/opt/entropy-arb
+Environment=PYTHONDONTWRITEBYTECODE=1 TZ=UTC LANG=C.UTF-8
+UMask=0077
+ExecStartPre=/usr/bin/test -s /opt/entropy-arb/config.live.yaml
+ExecStartPre=/usr/bin/test -s /opt/entropy-arb/.env
+ExecStart=/opt/entropy-arb/.venv-live/bin/python /opt/entropy-arb/main.py --live --symbol NVDA --hedge lighter --config /opt/entropy-arb/config.live.yaml --env-file /opt/entropy-arb/.env --no-dashboard
+StandardOutput=append:/opt/entropy-arb/logs/live-test-engine.log
+StandardError=append:/opt/entropy-arb/logs/live-test-engine.log
+KillSignal=SIGINT
+TimeoutStopSec=90
+Restart=no
+NoNewPrivileges=yes
+PrivateTmp=yes

@@ -1,0 +1,29 @@
+[Unit]
+Description=Export read-only Entropy dashboard data locally
+After=entropy-arb-record.service
+
+[Service]
+Type=simple
+User=entropyarb
+Group=caddy
+SupplementaryGroups=entropyarb
+Environment=PYTHONDONTWRITEBYTECODE=1 TZ=UTC LANG=C.UTF-8
+WorkingDirectory=/opt/entropy-dashboard
+ExecStart=/usr/bin/python3 /opt/entropy-dashboard/exporter.py
+UMask=0027
+RuntimeDirectory=entropy-monitor-export
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectProc=invisible
+InaccessiblePaths=-/opt/entropy-arb/.env
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

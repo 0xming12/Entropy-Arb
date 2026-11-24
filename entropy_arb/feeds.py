@@ -34,6 +34,8 @@ from .book import OrderBook
 log = logging.getLogger("feeds")
 INITIAL_SNAPSHOT_GRACE_SEC = 10.0
 RECONNECT_COOLDOWN_SEC = 30.0
+HL_MAX_SOURCE_LAG_SEC = 30.0
+HL_MAX_SOURCE_FUTURE_SEC = 2.0
 
 
 def _chan_id(channel: str) -> Optional[int]:
@@ -66,6 +68,7 @@ class LighterBookFeed:
         self._active_ws = None
         self._opened_at = 0.0
         self._next_reconnect_at = 0.0
+        self._close_tasks: set = set()
 
     def request_reconnect(self) -> None:
         """Proactively force a clean WS reconnect (e.g. on stale book detection)."""
@@ -77,7 +80,16 @@ class LighterBookFeed:
             return
         self.reconnect_evt.set()
         self._next_reconnect_at = now + RECONNECT_COOLDOWN_SEC
-        asyncio.create_task(ws.close())
+
+        async def _close_ws(sock) -> None:
+            try:
+                await sock.close()
+            except Exception:
+                pass
+
+        task = asyncio.create_task(_close_ws(ws))
+        self._close_tasks.add(task)
+        task.add_done_callback(self._close_tasks.discard)
 
     async def _subscribe(self, ws) -> None:
         await ws.send(json.dumps({"type": "subscribe",
@@ -185,9 +197,12 @@ class HLBookFeed:
         self.on_disconnect = on_disconnect
         self.reconnect_evt = reconnect_evt or asyncio.Event()
         self._snapped = False
+        self._last_source_ms: Optional[int] = None
         self._active_ws = None
         self._opened_at = 0.0
         self._next_reconnect_at = 0.0
+        self._last_drop_log = 0.0
+        self._close_tasks: set = set()
 
     def request_reconnect(self) -> None:
         """Proactively force a clean WS reconnect (e.g. on stale book detection)."""
@@ -199,14 +214,45 @@ class HLBookFeed:
             return
         self.reconnect_evt.set()
         self._next_reconnect_at = now + RECONNECT_COOLDOWN_SEC
-        asyncio.create_task(ws.close())
+
+        async def _close_ws(sock) -> None:
+            try:
+                await sock.close()
+            except Exception:
+                pass
+
+        task = asyncio.create_task(_close_ws(ws))
+        self._close_tasks.add(task)
+        task.add_done_callback(self._close_tasks.discard)
 
     def _on_frame(self, msg: dict) -> None:
         self.book.touch()
         if msg.get("channel") == "l2Book":
             d = msg.get("data") or {}
             if d.get("coin") == self.coin:
-                self.book.apply_hl(d["levels"])
+                source_ms = d.get("time")
+                if type(source_ms) is not int or source_ms <= 0:
+                    return
+                source_ts = source_ms / 1000.0
+                source_age = time.time() - source_ts
+                if not -HL_MAX_SOURCE_FUTURE_SEC <= source_age <= HL_MAX_SOURCE_LAG_SEC:
+                    now_mono = time.monotonic()
+                    if now_mono - self._last_drop_log >= 15.0:
+                        self._last_drop_log = now_mono
+                        log.warning(
+                            "[%s] dropped l2Book frame: source_age=%.2fs outside "
+                            "[%.1fs, %.1fs] (check local NTP clock sync)",
+                            self.name, source_age,
+                            -HL_MAX_SOURCE_FUTURE_SEC, HL_MAX_SOURCE_LAG_SEC,
+                        )
+                    return
+                if self._last_source_ms is not None and (
+                    source_ms < self._last_source_ms
+                    or (source_ms == self._last_source_ms and self.book.ready)
+                ):
+                    return
+                self.book.apply_hl(d["levels"], source_ts=source_ts)
+                self._last_source_ms = source_ms
                 if not self._snapped:
                     self._snapped = True
                     log.info("[%s] snapshot: %d bids / %d asks", self.name,

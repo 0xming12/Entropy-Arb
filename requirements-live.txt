@@ -3,7 +3,8 @@
 -r requirements.txt
 
 # Hyperliquid signing (Entropy leg, and the tradexyz hedge)
-hyperliquid-python-sdk>=0.9
+# 0.12.0 added the expires_after argument used by the order signer.
+hyperliquid-python-sdk>=0.12.0
 eth-account>=0.10
 
 # Lighter signing (only needed with --hedge lighter / lighter-rh).
