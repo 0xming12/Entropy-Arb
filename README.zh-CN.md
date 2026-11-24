@@ -185,6 +185,23 @@ python3 main.py --live --symbol SNDK --hedge lighter-rh
 - **仅实盘**：没有模拟成交模式。`--record-only` 是唯一无风险的运行方式，
   其余都是真金白银。
 
+## 执行日志与验收统计
+
+实盘每次发单都会向 `logging.exec_journal`（默认 `logs/exec_attempts.jsonl`，
+留空关闭）追加一行 JSON：从「策略选中信号」开始计时的各段时间戳（等锁与准备、
+订单日志落盘、发送前复核、Entropy 签名、请求往返、对冲腿落盘与成交确认），
+两条腿各自的状态与成交量，以及信号已持续的时长。尝试结束时如果仍有单腿净敞口，
+会继续计时，直到净仓位回到 `net_tolerance_base` 以内，再写一条 `exposure` 记录。
+日志只在两条腿都返回之后写入，写入失败只记日志、不影响交易。
+
+```bash
+python3 tools/exec_report.py --file logs/live-test-exec.jsonl --days 7
+```
+
+按美东交易日输出：Entropy 成交/拒单率、配对成交数、单腿暴露时长
+（中位数 / P95 / 最大值、超过 `--exposure-limit` 秒的次数）、各段耗时的中位数和 P95，
+以及成交和零成交订单发单前信号持续时长的对比。
+
 ## 目录结构
 
 ```
@@ -198,6 +215,8 @@ entropy_arb/engine.py    双交易所策略主循环
 entropy_arb/dashboard.py Rich 终端仪表盘
 entropy_arb/recorder.py  分钟级盘口数据采集
 tools/analyze.py         minutes.csv -> 阈值建议
+entropy_arb/exec_metrics.py  每次发单的耗时与结果日志、单腿暴露计时
+tools/exec_report.py     exec_attempts.jsonl -> 每日成交率、暴露时长、各段耗时
 tests/                   python3 -m pytest tests/
 ```
 

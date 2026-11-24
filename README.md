@@ -201,6 +201,28 @@ errors), credentials in `.env`, and the markets on the command line
 - **Live-only**: there is no simulated-fill mode. `--record-only` is the
   risk-free way to run it; anything else trades real money.
 
+## Execution journal
+
+Every live order attempt appends one JSON line to `logging.exec_journal`
+(default `logs/exec_attempts.jsonl`; empty string disables it): timestamps
+measured from the moment the strategy selected the signal (lock wait and
+preparation, order-journal fsync, pre-send recheck, Entropy signing and HTTP
+round trip, follow-up hedge journaling and settlement), each leg's status and
+fill, and how long the signal had persisted. If an attempt leaves net
+single-leg exposure, the clock keeps running until the net position is back
+inside `net_tolerance_base`, then an `exposure` record is written. The journal
+is written only after both legs return, and write errors are logged, never
+raised.
+
+```bash
+python3 tools/exec_report.py --file logs/live-test-exec.jsonl --days 7
+```
+
+Per America/New_York trading day it prints the Entropy fill / reject rate,
+paired fills, single-leg exposure (median / P95 / max, count over
+`--exposure-limit` seconds), median and P95 of each latency segment, and the
+signal persistence time of filled vs zero-fill orders.
+
 ## Layout
 
 ```
@@ -214,6 +236,8 @@ entropy_arb/engine.py    the two-venue strategy loop
 entropy_arb/dashboard.py Rich terminal dashboard
 entropy_arb/recorder.py  1-minute orderbook bars
 tools/analyze.py         minutes.csv -> suggested thresholds
+entropy_arb/exec_metrics.py  per-attempt timing/outcome journal, exposure timer
+tools/exec_report.py     exec_attempts.jsonl -> daily fill rate, exposure, latency
 tests/                   python3 -m pytest tests/
 ```
 

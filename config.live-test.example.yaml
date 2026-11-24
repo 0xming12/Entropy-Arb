@@ -115,5 +115,6 @@ logging:
   level: INFO
   status_interval_sec: 30.0
   trades_csv: logs/live-test-trades.csv
+  exec_journal: logs/live-test-exec.jsonl   # 每次发单的耗时与结果；用 tools/exec_report.py 汇总
   dashboard: true
   file: logs/live-test-engine.log
