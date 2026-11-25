@@ -78,6 +78,7 @@ def test_entropy_first_zero_fill_journals_entropy_leg_only(tmp_path):
     assert set(rec["legs"]) == {"entropy"}
     leg = rec["legs"]["entropy"]
     assert leg["status"] == "canceled" and leg["filled_base"] == 0.0
+    assert leg["client_order_id"] == "entropy-cid-1"
     assert rec["leg_gap_ms"] is None and rec["exposure_open"] is False
     assert rec["persist_ms"] == pytest.approx(750.0)
     marks = rec["marks_ms"]
@@ -107,9 +108,11 @@ def test_entropy_first_paired_fill_records_follow_timing_and_leg_gap(tmp_path):
     (rec,) = _records(journal)
     assert set(rec["legs"]) == {"entropy", "hedge"}
     e, h = rec["legs"]["entropy"], rec["legs"]["hedge"]
+    assert (e["client_order_id"], h["client_order_id"]) == ("entropy-cid-1", "hedge-cid-2")
     assert e["ack_ms"] <= rec["marks_ms"]["follow_staged"] <= h["call_start_ms"] <= h["ack_ms"]
     assert {"submit_start_ms", "submit_end_ms", "settle_ms"} <= set(h)
-    assert rec["leg_gap_ms"] == pytest.approx(h["ack_ms"] - e["ack_ms"], abs=1e-3)
+    # Both timestamps and the gap are independently rounded to 0.001 ms.
+    assert rec["leg_gap_ms"] == pytest.approx(h["ack_ms"] - e["ack_ms"], abs=2e-3)
     assert rec["matched"] == pytest.approx(0.09)
     assert rec["exposure_open"] is False and not eng.exposure.is_open
 
