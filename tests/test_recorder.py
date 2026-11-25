@@ -2,12 +2,15 @@
 
 Run:  python3 -m pytest tests/  (or  python3 tests/test_recorder.py)
 """
+import asyncio
 import csv
 import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -125,6 +128,49 @@ def test_depth_output_marks_heartbeat_only_book_as_stale():
         assert sample["entropy"]["bids"] == []
         assert sample["hedge"]["fresh"] is True
         assert sample["hedge"]["asks"] == [[101.0, 10.0]]
+
+
+def test_subsecond_depth_retains_five_levels_without_oversampling_minutes():
+    entropy, hedge = OrderBook(), OrderBook()
+    levels = [[{"px": str(100 - i), "sz": "10"} for i in range(7)],
+              [{"px": str(101 + i), "sz": "10"} for i in range(7)]]
+    entropy.apply_hl(levels)
+    hedge.apply_hl(levels)
+    start = time.time() // 60 * 60 + 5
+    settings = {"ENTROPY_RECORD_DEPTH": "1", "ENTROPY_RECORD_DEPTH_INTERVAL_SEC": "0.1",
+                "ENTROPY_RECORD_DEPTH_LEVELS": "5"}
+
+    async def capture(recorder):
+        stop = asyncio.Event()
+        tick = 10.0
+
+        async def wait_for(awaitable, timeout):
+            nonlocal tick
+            awaitable.close()
+            tick += timeout
+            if tick >= 11.25:
+                stop.set()
+            raise asyncio.TimeoutError
+
+        loop = SimpleNamespace(time=lambda: tick)
+        with (patch("entropy_arb.recorder.asyncio.get_running_loop", return_value=loop),
+              patch("entropy_arb.recorder.asyncio.wait_for", side_effect=wait_for),
+              patch("entropy_arb.recorder.time.time", side_effect=lambda: start + tick - 10)):
+            await recorder.run(stop)
+
+    with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, settings):
+        path = Path(directory) / "minutes.csv"
+        recorder = MinuteRecorder(str(path), entropy, hedge, 120.0)
+        asyncio.run(capture(recorder))
+        depth_file, = path.parent.glob("minutes.depth-*.jsonl")
+        depth = [json.loads(line) for line in depth_file.read_text().splitlines()]
+        assert [round(row["ts"] - start, 3) for row in depth] == [i / 10 for i in range(13)]
+        for venue in ("entropy", "hedge"):
+            for row in depth:
+                assert [price for price, _ in row[venue]["bids"]] == [100, 99, 98, 97, 96]
+                assert [price for price, _ in row[venue]["asks"]] == [101, 102, 103, 104, 105]
+        with path.open() as source:
+            assert [row["samples"] for row in csv.DictReader(source)] == ["2"]
 
 
 if __name__ == "__main__":

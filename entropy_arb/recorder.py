@@ -21,6 +21,10 @@ Definitions (all in bps, fees NOT included — the engine adds fees on top):
 Bid/ask columns are the minute's last fresh sample (close). A row is only
 written for minutes with at least one sample where both books were fresh;
 `samples` says how many of the ~60 seconds qualified.
+
+When ENTROPY_RECORD_DEPTH=1, optional ENTROPY_RECORD_DEPTH_INTERVAL_SEC and
+ENTROPY_RECORD_DEPTH_LEVELS control the JSONL snapshots independently of the
+minute CSV. For example, 0.1 and 5 keep five bid and ask levels per venue at 10 Hz.
 """
 from __future__ import annotations
 
@@ -48,6 +52,11 @@ HEADER = ["minute_ts", "time_utc",
           "premium_close_bps", "premium_mean_bps", "premium_std_bps",
           "sell_edge_mean_bps", "sell_edge_max_bps",
           "buy_edge_mean_bps", "buy_edge_max_bps", "samples"]
+
+
+def _next_tick(due: float, interval: float, now: float) -> float:
+    """Skip missed intervals if sampling or the event loop fell behind."""
+    return due + (math.floor((now - due) / interval) + 1) * interval
 
 
 class _MinuteAgg:
@@ -132,6 +141,15 @@ class MinuteRecorder:
         self.max_book_age_sec = max_book_age_sec if max_book_age_sec > 0 else staleness_sec
         self.interval_sec = interval_sec
         self.record_depth = os.environ.get("ENTROPY_RECORD_DEPTH") == "1"
+        self.depth_interval_sec = interval_sec
+        self.depth_levels = 10
+        if self.record_depth:
+            self.depth_interval_sec = float(os.getenv("ENTROPY_RECORD_DEPTH_INTERVAL_SEC", str(interval_sec)))
+            self.depth_levels = int(os.getenv("ENTROPY_RECORD_DEPTH_LEVELS", "10"))
+            if not math.isfinite(self.depth_interval_sec) or self.depth_interval_sec <= 0:
+                raise ValueError("ENTROPY_RECORD_DEPTH_INTERVAL_SEC must be finite and positive")
+            if self.depth_levels < 1:
+                raise ValueError("ENTROPY_RECORD_DEPTH_LEVELS must be a positive integer")
         self.rows_written = 0
         self._agg: Optional[_MinuteAgg] = None
         self._fh = None
@@ -156,8 +174,8 @@ class MinuteRecorder:
             books.append({
                 "fresh": fresh,
                 "update_age_sec": round(age, 3) if age is not None else None,
-                "bids": book.sorted_bids()[:10] if fresh else [],
-                "asks": book.sorted_asks()[:10] if fresh else [],
+                "bids": book.sorted_bids()[:self.depth_levels] if fresh else [],
+                "asks": book.sorted_asks()[:self.depth_levels] if fresh else [],
             })
         row = {"ts": round(now, 3), "entropy": books[0], "hedge": books[1]}
         self._depth_fh.write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -232,25 +250,27 @@ class MinuteRecorder:
         self._agg = None
 
     def sample(self, now: Optional[float] = None) -> None:
-        """Take one sample; call ~1/sec. Rolls the minute over as needed."""
-        now = time.time() if now is None else now
-        minute = int(now // 60)
-        if self._agg is not None and self._agg.minute != minute:
+        """Capture a minute-aggregation observation and, if enabled, depth."""
+        self._sample(time.time() if now is None else now, minute=True, depth=self.record_depth)
+
+    def _sample(self, now: float, *, minute: bool, depth: bool) -> None:
+        bucket = int(now // 60)
+        if minute and self._agg is not None and self._agg.minute != bucket:
             self._flush_agg()
         e_fresh = self.entropy_book.is_fresh(self.staleness_sec,
                                             max_book_age_sec=self.max_book_age_sec)
         h_fresh = self.hedge_book.is_fresh(self.staleness_sec,
                                           max_book_age_sec=self.max_book_age_sec)
-        if self.record_depth:
+        if depth:
             self._write_depth(now, e_fresh, h_fresh)
-        if not (e_fresh and h_fresh):
+        if not (minute and e_fresh and h_fresh):
             return
         e_bid, e_ask = self.entropy_book.best_bid(), self.entropy_book.best_ask()
         h_bid, h_ask = self.hedge_book.best_bid(), self.hedge_book.best_ask()
         if None in (e_bid, e_ask, h_bid, h_ask):
             return
         if self._agg is None:
-            self._agg = _MinuteAgg(minute)
+            self._agg = _MinuteAgg(bucket)
         self._agg.add(e_bid, e_ask, h_bid, h_ask)
 
     def close(self) -> None:
@@ -266,14 +286,26 @@ class MinuteRecorder:
                 self._depth_fh = self._depth_day = None
 
     async def run(self, stop: asyncio.Event) -> None:
+        clock = asyncio.get_running_loop().time
+        minute_due = clock()
+        depth_due = minute_due if self.record_depth else math.inf
         try:
             while not stop.is_set():
+                now = clock()
+                minute = now >= minute_due
+                depth = now >= depth_due
+                if minute or depth:
+                    try:
+                        self._sample(time.time(), minute=minute, depth=depth)
+                    except Exception:
+                        log.exception("recorder sample failed")
+                    now = clock()
+                    if minute:
+                        minute_due = _next_tick(minute_due, self.interval_sec, now)
+                    if depth:
+                        depth_due = _next_tick(depth_due, self.depth_interval_sec, now)
                 try:
-                    self.sample()
-                except Exception:
-                    log.exception("recorder sample failed")
-                try:
-                    await asyncio.wait_for(stop.wait(), timeout=self.interval_sec)
+                    await asyncio.wait_for(stop.wait(), timeout=max(0.0, min(minute_due, depth_due) - now))
                 except asyncio.TimeoutError:
                     pass
         finally:
