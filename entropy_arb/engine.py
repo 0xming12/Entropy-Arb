@@ -754,6 +754,14 @@ class Engine:
                                            max_book_age_sec=cfg.risk.max_book_age_sec)
             tasks.append(asyncio.create_task(self.recorder.run(self.stop),
                                              name="recorder"))
+        if self.record_only and os.getenv("ENTROPY_RECORD_PUBLIC_TAPE") == "1":
+            from .market_capture import record_entropy_market
+
+            tasks.append(asyncio.create_task(
+                record_entropy_market(self.entropy.ws_url, self.entropy.coin,
+                                      cfg.recorder_csv, self.stop),
+                name="entropy-public-tape",
+            ))
         if not self.record_only:
             tasks.append(asyncio.create_task(self._strategy_loop(),
                                              name="strategy"))
