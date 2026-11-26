@@ -77,6 +77,7 @@ class ExecTrace:
         timing = info.get("timing") if isinstance(info.get("timing"), dict) else {}
         rec: Dict[str, Any] = {
             "name": getattr(venue, "name", venue.key),
+            "client_order_id": info.get("client_order_id"),
             "qty": _finite(qty),
             "limit_px": _finite(limit_px),
             "status": info.get("status"),
