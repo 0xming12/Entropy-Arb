@@ -1,0 +1,8 @@
+[Service]
+Nice=19
+Environment=ENTROPY_RECORD_DEPTH=1
+Environment=ENTROPY_RECORD_DEPTH_INTERVAL_SEC=0.1
+Environment=ENTROPY_RECORD_DEPTH_LEVELS=5
+Environment=ENTROPY_RECORD_PUBLIC_TAPE=1
+ExecStart=
+ExecStart=/opt/entropy-arb/.venv/bin/python /opt/entropy-arb/deployment/collector_runtime/main.py --config /opt/entropy-arb/config.nvda-lighter.yaml --record-only --symbol NVDA --hedge lighter --env-file /dev/null --no-dashboard
